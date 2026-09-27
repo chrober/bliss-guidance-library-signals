@@ -1,44 +1,104 @@
 // SPDX-License-Identifier: GPL-3.0-only
 
 use bliss_playlist_guidance_spi::{
-    encode, Candidate, Capability, Diagnostics, GuidanceRequest, GuidanceResponse, GuidanceScope,
-    GuidanceSignal, Manifest, PROTOCOL_NAME, SPI_VERSION,
+    encode, ArtifactDescriptor, Candidate, Capability, ChannelDescriptor, Diagnostics,
+    GuidanceRequest, GuidanceResponse, GuidanceScope, GuidanceSignal, Manifest, ResourceAccess,
+    ResourceDescriptor, PROTOCOL_NAME, SPI_VERSION,
 };
+use rusqlite::{params_from_iter, Connection, OpenFlags};
 use serde::Deserialize;
-use serde_json::Value;
-use std::collections::HashMap;
+use sha2::{Digest, Sha256};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs;
 use std::io::{self, BufRead, Write};
+use std::time::{Duration, Instant};
 
-const PROVIDER_ID: &str = "playcount-guidance";
+const PROVIDER_ID: &str = "library-signals-guidance";
 const PROVIDER_VERSION: &str = env!("CARGO_PKG_VERSION");
+const PROGRAM: &str = env!("CARGO_PKG_NAME");
+const SQLITE_BATCH_LIMIT: usize = 900;
 
-#[derive(Debug, Deserialize)]
-struct PlayCountArtifact {
-    schema_version: u8,
-    schema_identity: String,
-    #[serde(default)]
-    generated_at: u64,
-    #[serde(default)]
-    database_cache_identity: String,
-    tracks: Vec<PlayCountTrack>,
+fn version_metadata_json() -> String {
+    format!(
+        "{{\"schema_version\":1,\"program\":\"{PROGRAM}\",\"version\":\"{PROVIDER_VERSION}\",\"provider_id\":\"{PROVIDER_ID}\",\"spi_version\":{SPI_VERSION}}}"
+    )
+}
+
+fn usage() -> &'static str {
+    "Usage:\n  bliss-guidance-library-signals version [--json]\n  bliss-guidance-library-signals"
 }
 
 #[derive(Debug, Deserialize)]
-struct PlayCountTrack {
-    database_file: String,
-    play_count: Option<u64>,
+struct IdentityArtifact {
+    schema_version: u8,
+    schema_identity: String,
+    candidates: Vec<CandidateIdentity>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CandidateIdentity {
+    candidate_id: String,
+    #[serde(default)]
+    lms_urlmd5: Option<String>,
+}
+
+#[derive(Clone, Default)]
+struct LocalSignals {
+    playcount: u64,
+    /// A null or zero value means that Lyrion has not recorded a play yet.
+    last_played: u64,
+    /// `added` is nullable in Lyrion's persist database.  A missing value is
+    /// deliberately neutral rather than being guessed as either old or new.
+    library_age: Option<u64>,
 }
 
 #[derive(Default)]
-struct Provider {
-    counts: HashMap<String, Option<u64>>,
-    percentiles: HashMap<String, f64>,
+struct SignalDistribution {
+    frequencies: BTreeMap<u64, u64>,
+    known_count: u64,
+    zero_count: u64,
+}
+
+impl SignalDistribution {
+    fn record(&mut self, value: u64) {
+        *self.frequencies.entry(value).or_insert(0) += 1;
+        self.known_count += 1;
+        if value == 0 {
+            self.zero_count += 1;
+        }
+    }
+
+    fn percentile(&self, value: u64) -> f64 {
+        if self.known_count <= 1 {
+            return 0.0;
+        }
+        let lower: u64 = self
+            .frequencies
+            .range(..value)
+            .map(|(_, frequency)| *frequency)
+            .sum();
+        let tied = self.frequencies.get(&value).copied().unwrap_or(0);
+        let average_rank = lower as f64 + (tied.saturating_sub(1) as f64 / 2.0);
+        (average_rank / (self.known_count - 1) as f64).clamp(0.0, 1.0)
+    }
+}
+
+#[derive(Default)]
+struct LibrarySignalsState {
+    connection: Option<Connection>,
+    playcount: SignalDistribution,
+    last_played: SignalDistribution,
+    library_age: SignalDistribution,
+    eligible_count: u64,
+    cached_signals: HashMap<String, Option<LocalSignals>>,
+    score_batches: u64,
+    score_query_batches: u64,
+    score_cache_hits: u64,
     snapshot_id: Option<String>,
     prepared: bool,
 }
 
-impl Provider {
+impl LibrarySignalsState {
     fn manifest() -> Manifest {
         Manifest {
             spi_version: SPI_VERSION,
@@ -46,65 +106,112 @@ impl Provider {
             provider_version: PROVIDER_VERSION.to_owned(),
             protocol: PROTOCOL_NAME.to_owned(),
             capabilities: vec![Capability::GlobalCandidateGuidance],
+            channels: vec![
+                ChannelDescriptor {
+                    channel: "playcount".to_owned(),
+                    scopes: vec![GuidanceScope::Global],
+                },
+                ChannelDescriptor {
+                    channel: "last_played".to_owned(),
+                    scopes: vec![GuidanceScope::Global],
+                },
+                ChannelDescriptor {
+                    channel: "library_age".to_owned(),
+                    scopes: vec![GuidanceScope::Global],
+                },
+            ],
             required_context: vec!["candidate_identity".to_owned()],
             configuration_schema: Some(serde_json::json!({
                 "type": "object",
-                "properties": {
-                    "artifact_path": {"type": "string", "minLength": 1}
-                },
-                "required": ["artifact_path"],
                 "additionalProperties": false
             })),
         }
     }
 
-    fn prepare(&mut self, options: &Value) -> Result<(Option<String>, Diagnostics), String> {
-        let artifact_path = options
-            .get("artifact_path")
-            .and_then(Value::as_str)
-            .filter(|path| !path.is_empty())
-            .ok_or_else(|| "options.artifact_path is required".to_owned())?;
-        let bytes = fs::read(artifact_path)
-            .map_err(|error| format!("cannot read play-count artifact: {error}"))?;
-        let artifact: PlayCountArtifact = serde_json::from_slice(&bytes)
-            .map_err(|error| format!("cannot decode play-count artifact: {error}"))?;
-        if artifact.schema_version != 1 || artifact.schema_identity != "lms-play-counts-v1" {
-            return Err("unsupported play-count artifact schema".to_owned());
+    fn prepare(
+        &mut self,
+        artifacts: &[ArtifactDescriptor],
+        resources: &[ResourceDescriptor],
+    ) -> Result<(Option<String>, Diagnostics), String> {
+        self.reset();
+        let artifact = required_artifact(artifacts, "eligible-candidate-identities-v1")?;
+        let bytes = verified_artifact_bytes(artifact)?;
+        let identities: IdentityArtifact = serde_json::from_slice(&bytes)
+            .map_err(|error| format!("cannot decode candidate-identity artifact: {error}"))?;
+        if identities.schema_version != 1
+            || identities.schema_identity != "eligible-candidate-identities-v1"
+        {
+            return Err("unsupported candidate-identity artifact schema".to_owned());
         }
-
-        self.counts.clear();
-        for track in artifact.tracks {
-            self.counts.insert(track.database_file, track.play_count);
-        }
-
-        let mut values: Vec<u64> = self
-            .counts
-            .values()
-            .map(|value| value.unwrap_or(0))
-            .collect();
-        values.sort_unstable();
-        values.dedup();
-        self.percentiles = self
-            .counts
+        if identities
+            .candidates
             .iter()
-            .map(|(database_file, value)| {
-                let normalized = value.unwrap_or(0);
-                let percentile = if values.len() <= 1 {
-                    0.0
-                } else {
-                    values.binary_search(&normalized).unwrap_or(0) as f64
-                        / (values.len() - 1) as f64
-                };
-                (database_file.clone(), percentile)
-            })
-            .collect();
+            .any(|identity| identity.candidate_id.trim().is_empty())
+        {
+            return Err("candidate-identity artifact contains an empty candidate ID".to_owned());
+        }
 
+        let resource = required_read_only_resource(resources, "lms-persist-sqlite-v1")?;
+        let connection = Connection::open_with_flags(
+            &resource.path,
+            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )
+        .map_err(|error| format!("cannot open Lyrion persist database read-only: {error}"))?;
+        connection
+            .busy_timeout(Duration::from_secs(2))
+            .map_err(|error| format!("cannot set SQLite busy timeout: {error}"))?;
+        connection
+            .execute_batch("PRAGMA query_only = ON; BEGIN;")
+            .map_err(|error| format!("cannot begin read-only SQLite snapshot: {error}"))?;
+        validate_tracks_persistent(&connection)?;
+
+        let started = Instant::now();
+        let mut playcount = SignalDistribution::default();
+        let mut last_played = SignalDistribution::default();
+        let mut library_age = SignalDistribution::default();
+        let mut prepare_query_batches = 0_u64;
+        let mut max_prepare_lookup_batch = 0_usize;
+        for identities_batch in identities.candidates.chunks(SQLITE_BATCH_LIMIT) {
+            let urlmd5s: Vec<String> = identities_batch
+                .iter()
+                .filter_map(|identity| identity.lms_urlmd5.clone())
+                .filter(|urlmd5| !urlmd5.trim().is_empty())
+                .collect();
+            max_prepare_lookup_batch = max_prepare_lookup_batch.max(urlmd5s.len());
+            prepare_query_batches += batch_count(urlmd5s.len());
+            let lookup = query_local_signals(&connection, &urlmd5s)?;
+            for identity in identities_batch {
+                let Some(urlmd5) = identity
+                    .lms_urlmd5
+                    .as_deref()
+                    .filter(|urlmd5| !urlmd5.trim().is_empty())
+                else {
+                    continue;
+                };
+                let Some(signals) = lookup.get(urlmd5) else {
+                    // This identity is not represented by the stable Lyrion
+                    // persistence database. Do not fabricate a ranking.
+                    continue;
+                };
+                playcount.record(signals.playcount);
+                last_played.record(signals.last_played);
+                if let Some(added) = signals.library_age {
+                    library_age.record(added);
+                }
+            }
+        }
+
+        let eligible_count = identities.candidates.len() as u64;
         let snapshot_id = format!(
-            "{}:{}:{}",
-            artifact.database_cache_identity,
-            artifact.generated_at,
-            values.len()
+            "sqlite:{}:{}",
+            &artifact.sha256[..artifact.sha256.len().min(16)],
+            eligible_count
         );
+        self.connection = Some(connection);
+        self.playcount = playcount;
+        self.last_played = last_played;
+        self.library_age = library_age;
+        self.eligible_count = eligible_count;
         self.snapshot_id = Some(snapshot_id.clone());
         self.prepared = true;
         Ok((
@@ -114,15 +221,24 @@ impl Provider {
                 request_count: 1,
                 failure_count: 0,
                 details: Some(serde_json::json!({
-                    "known_tracks": self.counts.values().filter(|value| value.is_some()).count(),
-                    "unknown_tracks": self.counts.values().filter(|value| value.is_none()).count(),
-                    "distinct_play_counts": values.len(),
+                    "eligible_candidates": eligible_count,
+                    "known_playcounts": self.playcount.known_count,
+                    "zero_playcounts": self.playcount.zero_count,
+                    "known_last_played": self.last_played.known_count,
+                    "never_played": self.last_played.zero_count,
+                    "known_library_age": self.library_age.known_count,
+                    "distinct_playcounts": self.playcount.frequencies.len(),
+                    "distinct_last_played": self.last_played.frequencies.len(),
+                    "distinct_library_age": self.library_age.frequencies.len(),
+                    "prepare_query_batches": prepare_query_batches,
+                    "max_prepare_lookup_batch": max_prepare_lookup_batch,
+                    "elapsed_ms": started.elapsed().as_millis(),
                 })),
             },
         ))
     }
 
-    fn score(&self, request_id: &str, candidates: &[Candidate]) -> GuidanceResponse {
+    fn score(&mut self, request_id: &str, candidates: &[Candidate]) -> GuidanceResponse {
         if !self.prepared {
             return GuidanceResponse::Error {
                 provider_id: Some(PROVIDER_ID.to_owned()),
@@ -131,29 +247,99 @@ impl Provider {
                 retryable: false,
             };
         }
+        let Some(connection) = self.connection.as_ref() else {
+            return GuidanceResponse::Error {
+                provider_id: Some(PROVIDER_ID.to_owned()),
+                code: "SNAPSHOT_UNAVAILABLE".to_owned(),
+                message: "provider has no active SQLite snapshot".to_owned(),
+                retryable: true,
+            };
+        };
+        let started = Instant::now();
+        let urls: BTreeSet<String> = candidates
+            .iter()
+            .filter_map(|candidate| candidate.lms_urlmd5.clone())
+            .filter(|urlmd5| !urlmd5.trim().is_empty())
+            .collect();
+        let uncached: Vec<String> = urls
+            .iter()
+            .filter(|urlmd5| !self.cached_signals.contains_key(*urlmd5))
+            .cloned()
+            .collect();
+        let cache_hits = urls.len().saturating_sub(uncached.len()) as u64;
+        let fetched = match query_local_signals(connection, &uncached) {
+            Ok(fetched) => fetched,
+            Err(message) => {
+                return GuidanceResponse::Error {
+                    provider_id: Some(PROVIDER_ID.to_owned()),
+                    code: "SCORE_LOOKUP_FAILED".to_owned(),
+                    message,
+                    retryable: true,
+                }
+            }
+        };
+        for urlmd5 in &uncached {
+            self.cached_signals
+                .insert(urlmd5.clone(), fetched.get(urlmd5).cloned());
+        }
 
         let signals: Vec<GuidanceSignal> = candidates
             .iter()
             .filter_map(|candidate| {
-                let database_file = candidate.database_file.as_ref()?;
-                let percentile = *self.percentiles.get(database_file)?;
-                Some(
+                let urlmd5 = candidate.lms_urlmd5.as_ref()?;
+                let values = self.cached_signals.get(urlmd5).and_then(Option::as_ref)?;
+                let mut signals = vec![
                     GuidanceSignal {
                         candidate_id: candidate.candidate_id.clone(),
+                        channel: "playcount".to_owned(),
                         scope: GuidanceScope::Global,
-                        // Convert [0, 1] frequency percentile into a symmetric
-                        // preference score. The optimizer applies the signed
-                        // job weight; this addon remains provider-neutral.
-                        score: (2.0 * percentile - 1.0).clamp(-1.0, 1.0),
+                        score: centered_percentile(self.playcount.percentile(values.playcount)),
                         confidence: 1.0,
-                        rationale: Some(format!("LMS play-count percentile {:.3}", percentile)),
+                        rationale: Some(format!(
+                            "Lyrion play-count percentile {:.3}",
+                            self.playcount.percentile(values.playcount)
+                        )),
                         observed_at: None,
                     }
                     .bounded(),
-                )
+                    GuidanceSignal {
+                        candidate_id: candidate.candidate_id.clone(),
+                        channel: "last_played".to_owned(),
+                        scope: GuidanceScope::Global,
+                        score: centered_percentile(self.last_played.percentile(values.last_played)),
+                        confidence: 1.0,
+                        rationale: Some(format!(
+                            "Lyrion last-played recency percentile {:.3}",
+                            self.last_played.percentile(values.last_played)
+                        )),
+                        observed_at: None,
+                    }
+                    .bounded(),
+                ];
+                if let Some(added) = values.library_age {
+                    signals.push(
+                        GuidanceSignal {
+                            candidate_id: candidate.candidate_id.clone(),
+                            channel: "library_age".to_owned(),
+                            scope: GuidanceScope::Global,
+                            score: centered_percentile(self.library_age.percentile(added)),
+                            confidence: 1.0,
+                            rationale: Some(format!(
+                                "Lyrion first-seen library-age percentile {:.3}",
+                                self.library_age.percentile(added)
+                            )),
+                            observed_at: None,
+                        }
+                        .bounded(),
+                    );
+                }
+                Some(signals)
             })
+            .flatten()
             .collect();
-        let matched = signals.len();
+        self.score_batches += 1;
+        self.score_query_batches += batch_count(uncached.len());
+        self.score_cache_hits += cache_hits;
         GuidanceResponse::Scores {
             provider_id: PROVIDER_ID.to_owned(),
             request_id: request_id.to_owned(),
@@ -162,39 +348,183 @@ impl Provider {
                 state: Some("fresh".to_owned()),
                 request_count: 1,
                 failure_count: 0,
-                details: Some(serde_json::json!({"matched_candidates": matched})),
+                details: Some(serde_json::json!({
+                    "eligible_candidates": self.eligible_count,
+                    "known_playcounts": self.playcount.known_count,
+                    "known_last_played": self.last_played.known_count,
+                    "known_library_age": self.library_age.known_count,
+                    "query_batches": batch_count(uncached.len()),
+                    "cache_hits": cache_hits,
+                    "total_score_batches": self.score_batches,
+                    "total_score_query_batches": self.score_query_batches,
+                    "total_cache_hits": self.score_cache_hits,
+                    "elapsed_ms": started.elapsed().as_millis(),
+                })),
             },
         }
     }
+
+    fn reset(&mut self) {
+        if let Some(connection) = self.connection.take() {
+            let _ = connection.execute_batch("ROLLBACK;");
+        }
+        self.playcount = SignalDistribution::default();
+        self.last_played = SignalDistribution::default();
+        self.library_age = SignalDistribution::default();
+        self.cached_signals.clear();
+        self.eligible_count = 0;
+        self.score_batches = 0;
+        self.score_query_batches = 0;
+        self.score_cache_hits = 0;
+        self.snapshot_id = None;
+        self.prepared = false;
+    }
 }
 
-fn handle(provider: &mut Provider, request: GuidanceRequest) -> GuidanceResponse {
+fn required_artifact<'a>(
+    artifacts: &'a [ArtifactDescriptor],
+    kind: &str,
+) -> Result<&'a ArtifactDescriptor, String> {
+    let matching: Vec<_> = artifacts
+        .iter()
+        .filter(|artifact| artifact.kind == kind)
+        .collect();
+    match matching.as_slice() {
+        [artifact] => Ok(*artifact),
+        [] => Err(format!("missing required {kind} artifact")),
+        _ => Err(format!("multiple {kind} artifacts are not allowed")),
+    }
+}
+
+fn required_read_only_resource<'a>(
+    resources: &'a [ResourceDescriptor],
+    kind: &str,
+) -> Result<&'a ResourceDescriptor, String> {
+    let matching: Vec<_> = resources
+        .iter()
+        .filter(|resource| resource.kind == kind)
+        .collect();
+    match matching.as_slice() {
+        [resource] if resource.access == ResourceAccess::ReadOnly => Ok(*resource),
+        [resource] => Err(format!("{} resource must be read_only", resource.kind)),
+        [] => Err(format!("missing required {kind} resource")),
+        _ => Err(format!("multiple {kind} resources are not allowed")),
+    }
+}
+
+fn verified_artifact_bytes(artifact: &ArtifactDescriptor) -> Result<Vec<u8>, String> {
+    let bytes = fs::read(&artifact.path)
+        .map_err(|error| format!("cannot read {} artifact: {error}", artifact.kind))?;
+    if format!("{:x}", Sha256::digest(&bytes)) != artifact.sha256 {
+        return Err(format!("{} artifact SHA-256 mismatch", artifact.kind));
+    }
+    Ok(bytes)
+}
+
+fn validate_tracks_persistent(connection: &Connection) -> Result<(), String> {
+    let exists: bool = connection
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'tracks_persistent')",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|error| format!("cannot inspect tracks_persistent schema: {error}"))?;
+    if !exists {
+        return Err("tracks_persistent table is unavailable".to_owned());
+    }
+    let mut statement = connection
+        .prepare("PRAGMA table_info(tracks_persistent)")
+        .map_err(|error| format!("cannot inspect tracks_persistent columns: {error}"))?;
+    let columns = statement
+        .query_map([], |row| row.get::<_, String>(1))
+        .map_err(|error| format!("cannot read tracks_persistent columns: {error}"))?
+        .collect::<Result<BTreeSet<_>, _>>()
+        .map_err(|error| format!("cannot decode tracks_persistent columns: {error}"))?;
+    let normalized_columns = columns
+        .iter()
+        .map(|column| column.to_ascii_lowercase())
+        .collect::<BTreeSet<_>>();
+    for column in ["urlmd5", "playcount", "lastplayed", "added"] {
+        if !normalized_columns.contains(column) {
+            return Err(format!("tracks_persistent.{column} column is unavailable"));
+        }
+    }
+    Ok(())
+}
+
+fn centered_percentile(percentile: f64) -> f64 {
+    (2.0 * percentile - 1.0).clamp(-1.0, 1.0)
+}
+
+fn query_local_signals(
+    connection: &Connection,
+    urlmd5s: &[String],
+) -> Result<HashMap<String, LocalSignals>, String> {
+    let mut result = HashMap::new();
+    let unique: Vec<String> = urlmd5s
+        .iter()
+        .cloned()
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    for batch in unique.chunks(SQLITE_BATCH_LIMIT) {
+        let placeholders = std::iter::repeat_n("?", batch.len())
+            .collect::<Vec<_>>()
+            .join(",");
+        let sql = format!(
+            "SELECT urlmd5, playCount, lastPlayed, added FROM tracks_persistent WHERE urlmd5 IN ({placeholders})"
+        );
+        let mut statement = connection
+            .prepare(&sql)
+            .map_err(|error| format!("cannot prepare Lyrion library-signal query: {error}"))?;
+        let rows = statement
+            .query_map(params_from_iter(batch.iter()), |row| {
+                let non_negative = |index| -> rusqlite::Result<Option<u64>> {
+                    row.get::<_, Option<i64>>(index)
+                        .map(|value| value.map(|value| value.max(0) as u64))
+                };
+                Ok((
+                    row.get::<_, String>(0)?,
+                    LocalSignals {
+                        playcount: non_negative(1)?.unwrap_or(0),
+                        last_played: non_negative(2)?.unwrap_or(0),
+                        library_age: non_negative(3)?,
+                    },
+                ))
+            })
+            .map_err(|error| format!("cannot query Lyrion library signals: {error}"))?;
+        for row in rows {
+            let (urlmd5, values) =
+                row.map_err(|error| format!("cannot decode Lyrion library signals: {error}"))?;
+            result.insert(urlmd5, values);
+        }
+    }
+    Ok(result)
+}
+
+fn batch_count(item_count: usize) -> u64 {
+    item_count.div_ceil(SQLITE_BATCH_LIMIT) as u64
+}
+
+fn handle(provider: &mut LibrarySignalsState, request: GuidanceRequest) -> GuidanceResponse {
     match request {
         GuidanceRequest::Describe { spi_version } => {
-            if spi_version != SPI_VERSION {
-                return GuidanceResponse::Error {
-                    provider_id: Some(PROVIDER_ID.to_owned()),
-                    code: "UNSUPPORTED_SPI_VERSION".to_owned(),
-                    message: format!("provider supports SPI version {SPI_VERSION}"),
-                    retryable: false,
-                };
+            if spi_version == SPI_VERSION {
+                GuidanceResponse::Manifest(LibrarySignalsState::manifest())
+            } else {
+                unsupported_version()
             }
-            GuidanceResponse::Manifest(Provider::manifest())
         }
         GuidanceRequest::Prepare {
             spi_version,
-            options,
+            artifacts,
+            resources,
             ..
         } => {
             if spi_version != SPI_VERSION {
-                return GuidanceResponse::Error {
-                    provider_id: Some(PROVIDER_ID.to_owned()),
-                    code: "UNSUPPORTED_SPI_VERSION".to_owned(),
-                    message: format!("provider supports SPI version {SPI_VERSION}"),
-                    retryable: false,
-                };
+                return unsupported_version();
             }
-            match provider.prepare(&options) {
+            match provider.prepare(&artifacts, &resources) {
                 Ok((snapshot_id, diagnostics)) => GuidanceResponse::Prepared {
                     provider_id: PROVIDER_ID.to_owned(),
                     snapshot_id,
@@ -214,39 +544,66 @@ fn handle(provider: &mut Provider, request: GuidanceRequest) -> GuidanceResponse
             candidates,
             ..
         } => {
-            if spi_version != SPI_VERSION {
-                return GuidanceResponse::Error {
-                    provider_id: Some(PROVIDER_ID.to_owned()),
-                    code: "UNSUPPORTED_SPI_VERSION".to_owned(),
-                    message: format!("provider supports SPI version {SPI_VERSION}"),
-                    retryable: false,
-                };
+            if spi_version == SPI_VERSION {
+                provider.score(&request_id, &candidates)
+            } else {
+                unsupported_version()
             }
-            provider.score(&request_id, &candidates)
         }
-        GuidanceRequest::Close { .. } => GuidanceResponse::Closed {
-            provider_id: PROVIDER_ID.to_owned(),
-        },
+        GuidanceRequest::Close { .. } => {
+            provider.reset();
+            GuidanceResponse::Closed {
+                provider_id: PROVIDER_ID.to_owned(),
+            }
+        }
+    }
+}
+
+fn unsupported_version() -> GuidanceResponse {
+    GuidanceResponse::Error {
+        provider_id: Some(PROVIDER_ID.to_owned()),
+        code: "UNSUPPORTED_SPI_VERSION".to_owned(),
+        message: format!("provider supports SPI version {SPI_VERSION}"),
+        retryable: false,
     }
 }
 
 fn main() {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    match args.as_slice() {
+        [] => {}
+        [command] if command == "version" => {
+            println!("{PROGRAM} {PROVIDER_VERSION}");
+            return;
+        }
+        [command, format] if command == "version" && format == "--json" => {
+            println!("{}", version_metadata_json());
+            return;
+        }
+        _ => {
+            eprintln!("{}", usage());
+            std::process::exit(2);
+        }
+    }
     let stdin = io::stdin();
     let mut stdout = io::BufWriter::new(io::stdout().lock());
-    let mut provider = Provider::default();
+    let mut provider = LibrarySignalsState::default();
     for line in stdin.lock().lines() {
         let line = match line {
             Ok(line) if !line.trim().is_empty() => line,
             Ok(_) => continue,
             Err(error) => {
-                let response = GuidanceResponse::Error {
-                    provider_id: Some(PROVIDER_ID.to_owned()),
-                    code: "INPUT_FAILED".to_owned(),
-                    message: error.to_string(),
-                    retryable: false,
-                };
-                let _ = writeln!(stdout, "{}", encode(&response).unwrap());
-                let _ = stdout.flush();
+                let _ = writeln!(
+                    stdout,
+                    "{}",
+                    encode(&GuidanceResponse::Error {
+                        provider_id: Some(PROVIDER_ID.to_owned()),
+                        code: "INPUT_FAILED".to_owned(),
+                        message: error.to_string(),
+                        retryable: false
+                    })
+                    .unwrap()
+                );
                 break;
             }
         };
@@ -259,10 +616,7 @@ fn main() {
                 retryable: false,
             },
         };
-        if writeln!(stdout, "{}", encode(&response).unwrap()).is_err() {
-            break;
-        }
-        if stdout.flush().is_err() {
+        if writeln!(stdout, "{}", encode(&response).unwrap()).is_err() || stdout.flush().is_err() {
             break;
         }
         if matches!(response, GuidanceResponse::Closed { .. }) {
@@ -274,20 +628,37 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::PathBuf;
+    use rusqlite::{params, Connection};
+    use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static FIXTURE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
-    fn fixture_path() -> PathBuf {
+    #[test]
+    fn version_metadata_identifies_library_signals_provider_and_spi() {
+        let metadata = version_metadata_json();
+        assert!(metadata.contains("\"program\":\"bliss-guidance-library-signals\""));
+        assert!(metadata.contains("\"provider_id\":\"library-signals-guidance\""));
+        assert!(metadata.contains("\"spi_version\":"));
+    }
+    fn fixture_path(extension: &str) -> PathBuf {
+        let sequence = FIXTURE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock is after the Unix epoch")
+            .as_nanos();
         std::env::temp_dir().join(format!(
-            "bliss-guidance-playcounts-{}-{}.json",
-            std::process::id(),
-            PROVIDER_VERSION.replace('.', "-")
+            "bliss-guidance-library-signals-{}-{timestamp}-{sequence}.{extension}",
+            std::process::id()
         ))
     }
-
-    fn candidate(id: &str, path: &str) -> Candidate {
+    fn sha256(path: &Path) -> String {
+        format!("{:x}", Sha256::digest(fs::read(path).unwrap()))
+    }
+    fn candidate(id: &str, urlmd5: &str) -> Candidate {
         Candidate {
             candidate_id: id.to_owned(),
-            database_file: Some(path.to_owned()),
+            lms_urlmd5: Some(urlmd5.to_owned()),
+            database_file: None,
             title: None,
             artist: None,
             album: None,
@@ -295,56 +666,290 @@ mod tests {
             artist_mbids: vec![],
         }
     }
-
+    fn fixture_database(rows: &[(&str, u64)]) -> PathBuf {
+        let path = fixture_path("sqlite");
+        let connection = Connection::open(&path).unwrap();
+        connection.execute_batch("PRAGMA journal_mode=WAL; CREATE TABLE tracks_persistent (urlmd5 TEXT PRIMARY KEY, playCount INTEGER, lastPlayed INTEGER, added INTEGER);").unwrap();
+        for (urlmd5, playcount) in rows {
+            connection
+                .execute(
+                    "INSERT INTO tracks_persistent(urlmd5, playCount) VALUES (?1, ?2)",
+                    params![urlmd5, playcount],
+                )
+                .unwrap();
+        }
+        path
+    }
+    fn library_signal_fixture_database(rows: &[(&str, u64, Option<u64>, Option<u64>)]) -> PathBuf {
+        let path = fixture_path("sqlite");
+        let connection = Connection::open(&path).unwrap();
+        connection.execute_batch(
+            "CREATE TABLE tracks_persistent (urlmd5 TEXT PRIMARY KEY, playCount INTEGER, lastPlayed INTEGER, added INTEGER);",
+        ).unwrap();
+        for (urlmd5, playcount, last_played, added) in rows {
+            connection
+                .execute(
+                    "INSERT INTO tracks_persistent(urlmd5, playCount, lastPlayed, added) VALUES (?1, ?2, ?3, ?4)",
+                    params![urlmd5, playcount, last_played, added],
+                )
+                .unwrap();
+        }
+        path
+    }
+    fn identity_artifact(identities: &[(&str, &str)]) -> (PathBuf, ArtifactDescriptor) {
+        let path = fixture_path("json");
+        let payload = serde_json::json!({"schema_version":1,"schema_identity":"eligible-candidate-identities-v1","candidates": identities.iter().map(|(candidate_id,lms_urlmd5)| serde_json::json!({"candidate_id":candidate_id,"lms_urlmd5":lms_urlmd5})).collect::<Vec<_>>()});
+        fs::write(&path, serde_json::to_vec(&payload).unwrap()).unwrap();
+        let descriptor = ArtifactDescriptor {
+            kind: "eligible-candidate-identities-v1".to_owned(),
+            path: path.display().to_string(),
+            sha256: sha256(&path),
+        };
+        (path, descriptor)
+    }
+    fn large_identity_artifact(count: usize) -> (PathBuf, ArtifactDescriptor) {
+        let path = fixture_path("json");
+        let candidates = (0..count)
+            .map(|index| {
+                serde_json::json!({
+                    "candidate_id": format!("candidate-{index:06}"),
+                    "lms_urlmd5": format!("url-{index:06}"),
+                })
+            })
+            .collect::<Vec<_>>();
+        let payload = serde_json::json!({
+            "schema_version": 1,
+            "schema_identity": "eligible-candidate-identities-v1",
+            "candidates": candidates,
+        });
+        fs::write(&path, serde_json::to_vec(&payload).unwrap()).unwrap();
+        let descriptor = ArtifactDescriptor {
+            kind: "eligible-candidate-identities-v1".to_owned(),
+            path: path.display().to_string(),
+            sha256: sha256(&path),
+        };
+        (path, descriptor)
+    }
+    fn persist_resource(path: &Path) -> ResourceDescriptor {
+        ResourceDescriptor {
+            kind: "lms-persist-sqlite-v1".to_owned(),
+            path: path.display().to_string(),
+            access: ResourceAccess::ReadOnly,
+        }
+    }
+    fn score(provider: &mut LibrarySignalsState, candidate_id: &str, urlmd5: &str) -> f64 {
+        match provider.score("score", &[candidate(candidate_id, urlmd5)]) {
+            GuidanceResponse::Scores { signals, .. } => {
+                signals
+                    .into_iter()
+                    .find(|signal| signal.candidate_id == candidate_id)
+                    .expect("candidate receives a signal")
+                    .score
+            }
+            other => panic!("expected score response, got {other:?}"),
+        }
+    }
     #[test]
-    fn manifest_identifies_playcount_guidance_provider() {
-        let manifest = Provider::manifest();
-        assert_eq!(manifest.provider_id, "playcount-guidance");
+    fn manifest_identifies_library_signals_provider() {
+        let manifest = LibrarySignalsState::manifest();
+        assert_eq!(manifest.provider_id, "library-signals-guidance");
         assert_eq!(manifest.protocol, PROTOCOL_NAME);
         assert_eq!(
             manifest.capabilities,
             vec![Capability::GlobalCandidateGuidance]
         );
+        assert!(manifest
+            .channels
+            .iter()
+            .all(|channel| channel.scopes == vec![GuidanceScope::Global]));
+    }
+    #[test]
+    fn manifest_identifies_library_signals_provider_and_all_lyrion_channels() {
+        let manifest = LibrarySignalsState::manifest();
+        assert_eq!(manifest.provider_id, "library-signals-guidance");
+        assert_eq!(
+            manifest
+                .channels
+                .iter()
+                .map(|channel| channel.channel.as_str())
+                .collect::<Vec<_>>(),
+            vec!["playcount", "last_played", "library_age"],
+        );
+    }
+    #[test]
+    fn scores_last_played_and_library_age_monotonically_and_leaves_missing_rows_neutral() {
+        let database = library_signal_fixture_database(&[
+            ("old-unplayed", 0, None, Some(100)),
+            ("recent-new", 12, Some(9_000), Some(9_000)),
+        ]);
+        let (artifact, descriptor) = identity_artifact(&[
+            ("old-unplayed", "old-unplayed"),
+            ("recent-new", "recent-new"),
+            ("missing", "missing"),
+        ]);
+        let mut provider = LibrarySignalsState::default();
+        provider
+            .prepare(&[descriptor], &[persist_resource(&database)])
+            .unwrap();
+        let GuidanceResponse::Scores { signals, .. } = provider.score(
+            "score",
+            &[
+                candidate("old-unplayed", "old-unplayed"),
+                candidate("recent-new", "recent-new"),
+                candidate("missing", "missing"),
+            ],
+        ) else {
+            panic!("expected score response");
+        };
+        let values = signals
+            .into_iter()
+            .map(|signal| ((signal.candidate_id, signal.channel), signal.score))
+            .collect::<BTreeMap<_, _>>();
+        assert!(
+            values[&("old-unplayed".to_owned(), "last_played".to_owned())]
+                < values[&("recent-new".to_owned(), "last_played".to_owned())]
+        );
+        assert!(
+            values[&("old-unplayed".to_owned(), "library_age".to_owned())]
+                < values[&("recent-new".to_owned(), "library_age".to_owned())]
+        );
+        assert!(!values.contains_key(&("missing".to_owned(), "playcount".to_owned())));
+        let _ = fs::remove_file(artifact);
+        let _ = fs::remove_file(database);
+    }
+    #[test]
+    fn sqlite_snapshot_scores_known_zero_and_leaves_absent_rows_neutral() {
+        let database = fixture_database(&[("zero", 0), ("favorite", 10)]);
+        let (artifact, descriptor) = identity_artifact(&[
+            ("zero", "zero"),
+            ("missing", "missing"),
+            ("favorite", "favorite"),
+        ]);
+        let mut provider = LibrarySignalsState::default();
+        provider
+            .prepare(&[descriptor], &[persist_resource(&database)])
+            .unwrap();
+        assert!(
+            score(&mut provider, "zero", "zero") < score(&mut provider, "favorite", "favorite")
+        );
+        let GuidanceResponse::Scores { signals, .. } =
+            provider.score("missing", &[candidate("missing", "missing")])
+        else {
+            panic!("expected score response");
+        };
+        assert!(signals.is_empty());
+        let _ = fs::remove_file(artifact);
+        let _ = fs::remove_file(database);
     }
 
     #[test]
-    fn prepare_and_score_maps_counts_to_percentile_guidance() {
-        let path = fixture_path();
-        let artifact = serde_json::json!({
-            "schema_version": 1,
-            "schema_identity": "lms-play-counts-v1",
-            "generated_at": 42,
-            "database_cache_identity": "cache-1",
-            "tracks": [
-                {"database_file": "/music/quiet.mp3", "play_count": 0},
-                {"database_file": "/music/favorite.mp3", "play_count": 10},
-                {"database_file": "/music/unknown.mp3", "play_count": null}
-            ]
-        });
-        fs::write(&path, serde_json::to_vec(&artifact).unwrap()).unwrap();
-
-        let mut provider = Provider::default();
-        provider
-            .prepare(&serde_json::json!({"artifact_path": path}))
+    fn accepts_lyrion_camel_case_play_count_column() {
+        let database = fixture_path("sqlite");
+        let connection = Connection::open(&database).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE tracks_persistent (urlmd5 TEXT PRIMARY KEY, playCount INTEGER, lastPlayed INTEGER, added INTEGER);",
+            )
             .unwrap();
-        let response = provider.score(
-            "request-1",
-            &[
-                candidate("quiet", "/music/quiet.mp3"),
-                candidate("favorite", "/music/favorite.mp3"),
-                candidate("not-in-snapshot", "/music/missing.mp3"),
-            ],
+        connection
+            .execute(
+                "INSERT INTO tracks_persistent(urlmd5, playCount) VALUES (?1, ?2)",
+                params!["favorite", 10],
+            )
+            .unwrap();
+        let (artifact, descriptor) = identity_artifact(&[("favorite", "favorite")]);
+        let mut provider = LibrarySignalsState::default();
+
+        provider
+            .prepare(&[descriptor], &[persist_resource(&database)])
+            .expect("Lyrion's playCount column must be accepted");
+        assert_eq!(score(&mut provider, "favorite", "favorite"), -1.0);
+
+        let _ = fs::remove_file(artifact);
+        let _ = fs::remove_file(database);
+    }
+    #[test]
+    fn equal_counts_use_the_same_average_rank_across_score_batches() {
+        let database = fixture_database(&[("same-a", 5), ("same-b", 5), ("high", 20)]);
+        let (artifact, descriptor) =
+            identity_artifact(&[("same-a", "same-a"), ("same-b", "same-b"), ("high", "high")]);
+        let mut provider = LibrarySignalsState::default();
+        provider
+            .prepare(&[descriptor], &[persist_resource(&database)])
+            .unwrap();
+        assert_eq!(
+            score(&mut provider, "same-a", "same-a"),
+            score(&mut provider, "same-b", "same-b")
         );
-        match response {
-            GuidanceResponse::Scores { signals, .. } => {
-                assert_eq!(signals.len(), 2);
-                assert_eq!(signals[0].candidate_id, "quiet");
-                assert_eq!(signals[1].candidate_id, "favorite");
-                assert_eq!(signals[0].score, -1.0);
-                assert_eq!(signals[1].score, 1.0);
-            }
-            other => panic!("expected scores response, got {other:?}"),
-        }
-        let _ = fs::remove_file(path);
+        assert!(score(&mut provider, "same-a", "same-a") < score(&mut provider, "high", "high"));
+        let _ = fs::remove_file(artifact);
+        let _ = fs::remove_file(database);
+    }
+    #[test]
+    fn prepared_snapshot_ignores_a_later_external_database_update() {
+        let database = fixture_database(&[("song", 1), ("other", 10)]);
+        let (artifact, descriptor) = identity_artifact(&[("song", "song"), ("other", "other")]);
+        let mut provider = LibrarySignalsState::default();
+        provider
+            .prepare(&[descriptor], &[persist_resource(&database)])
+            .unwrap();
+        // Establish the snapshot through a different candidate, leaving
+        // `song` uncached when the concurrent write happens.
+        assert_eq!(score(&mut provider, "other", "other"), 1.0);
+        Connection::open(&database)
+            .unwrap()
+            .execute(
+                "UPDATE tracks_persistent SET playcount = 999 WHERE urlmd5 = 'song'",
+                [],
+            )
+            .unwrap();
+        assert_eq!(score(&mut provider, "song", "song"), -1.0);
+        let _ = fs::remove_file(artifact);
+        let _ = fs::remove_file(database);
+    }
+    #[test]
+    fn missing_persistent_schema_is_rejected_during_prepare() {
+        let database = fixture_path("sqlite");
+        Connection::open(&database).unwrap();
+        let (artifact, descriptor) = identity_artifact(&[("song", "song")]);
+        let error = LibrarySignalsState::default()
+            .prepare(&[descriptor], &[persist_resource(&database)])
+            .unwrap_err();
+        assert!(error.contains("tracks_persistent"));
+        let _ = fs::remove_file(artifact);
+        let _ = fs::remove_file(database);
+    }
+
+    #[test]
+    fn preparation_streams_a_200k_identity_population_in_bounded_batches() {
+        let database = fixture_database(&[("url-000000", 0)]);
+        let (artifact, descriptor) = large_identity_artifact(200_000);
+        let mut provider = LibrarySignalsState::default();
+        let (_, diagnostics) = provider
+            .prepare(&[descriptor], &[persist_resource(&database)])
+            .unwrap();
+        let details = diagnostics.details.expect("preparation diagnostics");
+        assert_eq!(details["eligible_candidates"].as_u64(), Some(200_000));
+        assert!(
+            details["max_prepare_lookup_batch"]
+                .as_u64()
+                .expect("bounded batch telemetry")
+                <= SQLITE_BATCH_LIMIT as u64
+        );
+        assert!(provider.cached_signals.is_empty());
+
+        let first = provider.score("first", &[candidate("candidate-000000", "url-000000")]);
+        let second = provider.score("second", &[candidate("candidate-000000", "url-000000")]);
+        assert!(matches!(first, GuidanceResponse::Scores { signals, .. } if signals.len() == 2));
+        let GuidanceResponse::Scores { diagnostics, .. } = second else {
+            panic!("expected cached score response");
+        };
+        assert_eq!(
+            diagnostics.details.expect("score diagnostics")["cache_hits"].as_u64(),
+            Some(1),
+        );
+
+        let _ = fs::remove_file(artifact);
+        let _ = fs::remove_file(database);
     }
 }

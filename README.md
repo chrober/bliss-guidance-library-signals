@@ -1,68 +1,38 @@
-# bliss-guidance-playcounts
+# bliss-guidance-library-signals
 
-`bliss-guidance-playcounts` is a provider addon for the
-`bliss-playlist-optimizer` guidance SPI. It reads an `lms-play-counts-v1` raw
-snapshot, maps counts to stable candidate identities, and returns bounded global
-preference guidance for each requested candidate. The optimizer applies the
-job's signed play-count influence; this addon does not decide hard eligibility
-or route validity.
+`bliss-guidance-library-signals` is an optional
+[Bliss guidance SPI](https://github.com/chrober/bliss-playlist-guidance-spi)
+provider for Lyrion's own listening and library history. It supplies three
+small, normalized signals while leaving Bliss as the authority for acoustic
+similarity, eligibility, repeat windows, and route validity.
 
-Its SPI provider ID is `playcount-guidance`. It reads a frozen snapshot rather
-than querying LMS directly, so addon execution remains deterministic and
-network-free.
+| Channel | Source in Lyrion `persist.db` | What its signed host policy can prefer |
+| --- | --- | --- |
+| `playcount` | `tracks_persistent.playCount` | less- or more-played tracks |
+| `last_played` | `tracks_persistent.lastPlayed` | longer-unheard or recently played tracks |
+| `library_age` | `tracks_persistent.added` | older or newer library additions |
 
-## Data and information flow
+The provider is started by a compatible host such as
+[bliss-playlist-optimizer](https://github.com/chrober/bliss-playlist-optimizer),
+not by Lyrion directly. Better Call Bliss supplies a trusted, read-only
+`persist.db` descriptor and the frozen eligible candidate identities. The
+provider never uses or requires Alternative Play Count (APC); APC-based
+guidance is intentionally future, separate work.
 
 ```mermaid
 flowchart LR
-    S[BlissMixerLab statistics and play-count influence] --> B[Better Call Bliss]
-    D[LMS library database: tracks + tracks_persistent] --> B
-    B -->|capture once for this job| E[lms-play-counts-v1 artifact]
-    I[Frozen candidate inventory and cache identity] --> B
-    B -->|bind snapshot to candidate database identity| E
-    E -->|artifact_path in prepare options| P[bliss-guidance-playcounts]
-    C[Candidate batch] -->|score request| P
-    P -->|global GuidanceSignal| O[Optimizer guidance host]
+    B[Better Call Bliss] -->|frozen eligible identities + read-only persist.db| O[bliss-playlist-optimizer]
+    O -->|prepare and shortlist score requests| P[Library signals provider]
+    P -->|playcount, last_played, library_age| O
+    O -->|Bliss-first route with guidance provenance| B
 ```
 
-Better Call Bliss owns the user-facing play-count policy. It reads the enabled
-statistics state and signed play-count influence from the compatible
-BlissMixerLab capability snapshot, then carries the resulting job value in the
-optimizer request. For a job that needs play counts, Better Call Bliss queries
-the LMS `tracks` and `tracks_persistent` tables, maps local URLs to Bliss
-`database_file` identities, yields between batches to keep LMS responsive, and
-writes a frozen `lms-play-counts-v1` artifact. The artifact includes the
-database cache identity and capture time, so it is bound to the same analyzed
-library snapshot as the candidate inventory.
+At preparation, the provider verifies the identity artifact, opens one
+read-only SQLite snapshot, and retains only three frequency distributions.
+At scoring, it queries only the optimizer's already-admitted shortlist and
+caches those job-local results. Rows missing from `tracks_persistent`, and
+missing `added` values, remain neutral rather than receiving invented ranks.
 
-This add-on consumes no LMS database, BlissMixerLab setting, or Better Call
-Bliss setting directly. Its only configuration is the trusted `artifact_path` in
-the SPI `prepare` request. That makes provider execution deterministic and keeps
-LMS database access outside the native route-search process.
-
-During `prepare`, the add-on reads the artifact once, keeps each candidate's
-count keyed by `database_file`, and converts distinct observed counts to a
-stable percentile. Missing counts are represented as zero for ordering, matching
-the existing optimizer contract. For `score`, it returns a global signal for
-each requested candidate present in the snapshot: the lowest percentile maps to
-`-1`, the highest to `+1`, and intermediate counts map linearly between them.
-The signed per-job influence determines whether the host would later prefer
-more- or less-played tracks; this provider itself does not choose a direction.
-
-The current optimizer host records these signals and diagnostics, but its first
-SPI gate does not yet apply them to route selection. The existing request-level
-play-count contract remains the active compatibility path until shared host-side
-reranking is connected.
-
-The addon communicates through versioned JSONL on stdin/stdout. It is intended
-to be discovered and started by the optimizer, not called directly by LMS.
-
-Prepare options:
-
-```json
-{ "artifact_path": "/path/to/play-counts.json" }
-```
-
-Unknown counts are treated as zero for percentile ordering, matching the
-optimizer's current play-count contract. The provider remains network-free and
-does not access the LMS database directly.
+See the [SPI contract](https://github.com/chrober/bliss-playlist-guidance-spi)
+for the host-neutral JSONL protocol and the optimizer repository for the
+host-side orchestration.

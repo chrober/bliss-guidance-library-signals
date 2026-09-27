@@ -28,10 +28,14 @@ flowchart LR
 ```
 
 At preparation, the provider verifies the identity artifact, opens one
-read-only SQLite snapshot, and retains only three frequency distributions.
-At scoring, it queries only the optimizer's already-admitted shortlist and
-caches those job-local results. Rows missing from `tracks_persistent`, and
-missing `added` values, remain neutral rather than receiving invented ranks.
+read-only SQLite snapshot, freezes `as_of_unix_seconds` plus the configured
+last-played and library-age horizons, and retains only the play-count
+distribution. Date channels use BlissMixerLab's exponential saturation curve:
+never played is distinct from an unknown row, future dates are treated as new,
+and ages beyond a horizon taper rather than growing without limit. At scoring,
+the provider queries only the optimizer's already-admitted shortlist and caches
+those job-local results. Rows missing from `tracks_persistent`, and missing or
+zero `added` values, remain neutral rather than receiving invented ranks.
 
 See the [SPI contract](https://github.com/chrober/bliss-playlist-guidance-spi)
 for the host-neutral JSONL protocol and the optimizer repository for the

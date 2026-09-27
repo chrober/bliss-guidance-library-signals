@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-only
 
+use bliss_playlist_guidance_spi::policy::{saturating_time_signal, HostPolicyKind};
 use bliss_playlist_guidance_spi::{
     encode, ArtifactDescriptor, Candidate, Capability, ChannelDescriptor, Diagnostics,
     GuidanceRequest, GuidanceResponse, GuidanceScope, GuidanceSignal, Manifest, ResourceAccess,
@@ -7,6 +8,7 @@ use bliss_playlist_guidance_spi::{
 };
 use rusqlite::{params_from_iter, Connection, OpenFlags};
 use serde::Deserialize;
+use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs;
@@ -17,6 +19,12 @@ const PROVIDER_ID: &str = "library-signals-guidance";
 const PROVIDER_VERSION: &str = env!("CARGO_PKG_VERSION");
 const PROGRAM: &str = env!("CARGO_PKG_NAME");
 const SQLITE_BATCH_LIMIT: usize = 900;
+const SECONDS_PER_DAY: i64 = 86_400;
+const MIN_HORIZON_DAYS: u64 = 30;
+const MAX_LAST_PLAYED_HORIZON_DAYS: u64 = 1_825;
+const MAX_LIBRARY_AGE_HORIZON_DAYS: u64 = 3_650;
+const DEFAULT_LAST_PLAYED_HORIZON_DAYS: u64 = 180;
+const DEFAULT_LIBRARY_AGE_HORIZON_DAYS: u64 = 365;
 
 fn version_metadata_json() -> String {
     format!(
@@ -83,12 +91,70 @@ impl SignalDistribution {
     }
 }
 
+#[derive(Clone, Debug)]
+struct FrozenTimeOptions {
+    as_of_unix_seconds: i64,
+    last_played_horizon_days: u64,
+    library_age_horizon_days: u64,
+}
+
+impl FrozenTimeOptions {
+    fn parse(options: &Value) -> Result<Self, String> {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(|error| format!("cannot determine current time: {error}"))?
+            .as_secs()
+            .min(i64::MAX as u64) as i64;
+        let as_of_unix_seconds = options
+            .get("as_of_unix_seconds")
+            .map(|value| {
+                value
+                    .as_i64()
+                    .ok_or_else(|| "as_of_unix_seconds must be an integer".to_owned())
+            })
+            .transpose()?
+            .unwrap_or(now);
+        if as_of_unix_seconds < 0 {
+            return Err("as_of_unix_seconds must not be negative".to_owned());
+        }
+        Ok(Self {
+            as_of_unix_seconds,
+            last_played_horizon_days: horizon_option(
+                options,
+                "last_played_horizon_days",
+                DEFAULT_LAST_PLAYED_HORIZON_DAYS,
+                MAX_LAST_PLAYED_HORIZON_DAYS,
+            )?,
+            library_age_horizon_days: horizon_option(
+                options,
+                "library_age_horizon_days",
+                DEFAULT_LIBRARY_AGE_HORIZON_DAYS,
+                MAX_LIBRARY_AGE_HORIZON_DAYS,
+            )?,
+        })
+    }
+
+    fn last_played_horizon_seconds(&self) -> i64 {
+        i64::try_from(self.last_played_horizon_days)
+            .unwrap_or(i64::MAX / SECONDS_PER_DAY)
+            .saturating_mul(SECONDS_PER_DAY)
+    }
+
+    fn library_age_horizon_seconds(&self) -> i64 {
+        i64::try_from(self.library_age_horizon_days)
+            .unwrap_or(i64::MAX / SECONDS_PER_DAY)
+            .saturating_mul(SECONDS_PER_DAY)
+    }
+}
+
 #[derive(Default)]
 struct LibrarySignalsState {
     connection: Option<Connection>,
     playcount: SignalDistribution,
-    last_played: SignalDistribution,
-    library_age: SignalDistribution,
+    known_last_played: u64,
+    never_played: u64,
+    known_library_age: u64,
+    time_options: Option<FrozenTimeOptions>,
     eligible_count: u64,
     cached_signals: HashMap<String, Option<LocalSignals>>,
     score_batches: u64,
@@ -110,19 +176,27 @@ impl LibrarySignalsState {
                 ChannelDescriptor {
                     channel: "playcount".to_owned(),
                     scopes: vec![GuidanceScope::Global],
+                    supported_host_policies: vec![HostPolicyKind::BoundedInfluence],
                 },
                 ChannelDescriptor {
                     channel: "last_played".to_owned(),
                     scopes: vec![GuidanceScope::Global],
+                    supported_host_policies: vec![HostPolicyKind::BoundedInfluence],
                 },
                 ChannelDescriptor {
                     channel: "library_age".to_owned(),
                     scopes: vec![GuidanceScope::Global],
+                    supported_host_policies: vec![HostPolicyKind::BoundedInfluence],
                 },
             ],
             required_context: vec!["candidate_identity".to_owned()],
             configuration_schema: Some(serde_json::json!({
                 "type": "object",
+                "properties": {
+                    "as_of_unix_seconds": { "type": "integer", "minimum": 0 },
+                    "last_played_horizon_days": { "type": "integer", "minimum": MIN_HORIZON_DAYS, "maximum": MAX_LAST_PLAYED_HORIZON_DAYS },
+                    "library_age_horizon_days": { "type": "integer", "minimum": MIN_HORIZON_DAYS, "maximum": MAX_LIBRARY_AGE_HORIZON_DAYS }
+                },
                 "additionalProperties": false
             })),
         }
@@ -133,7 +207,17 @@ impl LibrarySignalsState {
         artifacts: &[ArtifactDescriptor],
         resources: &[ResourceDescriptor],
     ) -> Result<(Option<String>, Diagnostics), String> {
+        self.prepare_with_options(&Value::Null, artifacts, resources)
+    }
+
+    fn prepare_with_options(
+        &mut self,
+        options: &Value,
+        artifacts: &[ArtifactDescriptor],
+        resources: &[ResourceDescriptor],
+    ) -> Result<(Option<String>, Diagnostics), String> {
         self.reset();
+        let time_options = FrozenTimeOptions::parse(options)?;
         let artifact = required_artifact(artifacts, "eligible-candidate-identities-v1")?;
         let bytes = verified_artifact_bytes(artifact)?;
         let identities: IdentityArtifact = serde_json::from_slice(&bytes)
@@ -167,8 +251,9 @@ impl LibrarySignalsState {
 
         let started = Instant::now();
         let mut playcount = SignalDistribution::default();
-        let mut last_played = SignalDistribution::default();
-        let mut library_age = SignalDistribution::default();
+        let mut known_last_played = 0_u64;
+        let mut never_played = 0_u64;
+        let mut known_library_age = 0_u64;
         let mut prepare_query_batches = 0_u64;
         let mut max_prepare_lookup_batch = 0_usize;
         for identities_batch in identities.candidates.chunks(SQLITE_BATCH_LIMIT) {
@@ -194,9 +279,14 @@ impl LibrarySignalsState {
                     continue;
                 };
                 playcount.record(signals.playcount);
-                last_played.record(signals.last_played);
+                known_last_played += 1;
+                if signals.last_played == 0 {
+                    never_played += 1;
+                }
                 if let Some(added) = signals.library_age {
-                    library_age.record(added);
+                    if added > 0 {
+                        known_library_age += 1;
+                    }
                 }
             }
         }
@@ -209,8 +299,10 @@ impl LibrarySignalsState {
         );
         self.connection = Some(connection);
         self.playcount = playcount;
-        self.last_played = last_played;
-        self.library_age = library_age;
+        self.known_last_played = known_last_played;
+        self.never_played = never_played;
+        self.known_library_age = known_library_age;
+        self.time_options = Some(time_options.clone());
         self.eligible_count = eligible_count;
         self.snapshot_id = Some(snapshot_id.clone());
         self.prepared = true;
@@ -224,12 +316,13 @@ impl LibrarySignalsState {
                     "eligible_candidates": eligible_count,
                     "known_playcounts": self.playcount.known_count,
                     "zero_playcounts": self.playcount.zero_count,
-                    "known_last_played": self.last_played.known_count,
-                    "never_played": self.last_played.zero_count,
-                    "known_library_age": self.library_age.known_count,
+                    "known_last_played": self.known_last_played,
+                    "never_played": self.never_played,
+                    "known_library_age": self.known_library_age,
                     "distinct_playcounts": self.playcount.frequencies.len(),
-                    "distinct_last_played": self.last_played.frequencies.len(),
-                    "distinct_library_age": self.library_age.frequencies.len(),
+                    "as_of_unix_seconds": time_options.as_of_unix_seconds,
+                    "last_played_horizon_days": time_options.last_played_horizon_days,
+                    "library_age_horizon_days": time_options.library_age_horizon_days,
                     "prepare_query_batches": prepare_query_batches,
                     "max_prepare_lookup_batch": max_prepare_lookup_batch,
                     "elapsed_ms": started.elapsed().as_millis(),
@@ -253,6 +346,14 @@ impl LibrarySignalsState {
                 code: "SNAPSHOT_UNAVAILABLE".to_owned(),
                 message: "provider has no active SQLite snapshot".to_owned(),
                 retryable: true,
+            };
+        };
+        let Some(time_options) = self.time_options.as_ref() else {
+            return GuidanceResponse::Error {
+                provider_id: Some(PROVIDER_ID.to_owned()),
+                code: "TIME_OPTIONS_UNAVAILABLE".to_owned(),
+                message: "provider has no frozen time options".to_owned(),
+                retryable: false,
             };
         };
         let started = Instant::now();
@@ -306,27 +407,40 @@ impl LibrarySignalsState {
                         candidate_id: candidate.candidate_id.clone(),
                         channel: "last_played".to_owned(),
                         scope: GuidanceScope::Global,
-                        score: centered_percentile(self.last_played.percentile(values.last_played)),
+                        score: saturating_time_signal(
+                            i64::try_from(values.last_played).ok(),
+                            time_options.as_of_unix_seconds,
+                            time_options.last_played_horizon_seconds(),
+                            true,
+                        )?,
                         confidence: 1.0,
                         rationale: Some(format!(
-                            "Lyrion last-played recency percentile {:.3}",
-                            self.last_played.percentile(values.last_played)
+                            "Lyrion last-played signal with frozen as_of {} and {}-day horizon",
+                            time_options.as_of_unix_seconds, time_options.last_played_horizon_days,
                         )),
                         observed_at: None,
                     }
                     .bounded(),
                 ];
-                if let Some(added) = values.library_age {
+                if let Some(signal) = values.library_age.and_then(|added| {
+                    saturating_time_signal(
+                        i64::try_from(added).ok(),
+                        time_options.as_of_unix_seconds,
+                        time_options.library_age_horizon_seconds(),
+                        false,
+                    )
+                }) {
                     signals.push(
                         GuidanceSignal {
                             candidate_id: candidate.candidate_id.clone(),
                             channel: "library_age".to_owned(),
                             scope: GuidanceScope::Global,
-                            score: centered_percentile(self.library_age.percentile(added)),
+                            score: signal,
                             confidence: 1.0,
                             rationale: Some(format!(
-                                "Lyrion first-seen library-age percentile {:.3}",
-                                self.library_age.percentile(added)
+                                "Lyrion library-age signal with frozen as_of {} and {}-day horizon",
+                                time_options.as_of_unix_seconds,
+                                time_options.library_age_horizon_days,
                             )),
                             observed_at: None,
                         }
@@ -351,8 +465,11 @@ impl LibrarySignalsState {
                 details: Some(serde_json::json!({
                     "eligible_candidates": self.eligible_count,
                     "known_playcounts": self.playcount.known_count,
-                    "known_last_played": self.last_played.known_count,
-                    "known_library_age": self.library_age.known_count,
+                    "known_last_played": self.known_last_played,
+                    "known_library_age": self.known_library_age,
+                    "as_of_unix_seconds": time_options.as_of_unix_seconds,
+                    "last_played_horizon_days": time_options.last_played_horizon_days,
+                    "library_age_horizon_days": time_options.library_age_horizon_days,
                     "query_batches": batch_count(uncached.len()),
                     "cache_hits": cache_hits,
                     "total_score_batches": self.score_batches,
@@ -369,8 +486,10 @@ impl LibrarySignalsState {
             let _ = connection.execute_batch("ROLLBACK;");
         }
         self.playcount = SignalDistribution::default();
-        self.last_played = SignalDistribution::default();
-        self.library_age = SignalDistribution::default();
+        self.known_last_played = 0;
+        self.never_played = 0;
+        self.known_library_age = 0;
+        self.time_options = None;
         self.cached_signals.clear();
         self.eligible_count = 0;
         self.score_batches = 0;
@@ -456,6 +575,24 @@ fn centered_percentile(percentile: f64) -> f64 {
     (2.0 * percentile - 1.0).clamp(-1.0, 1.0)
 }
 
+fn horizon_option(options: &Value, key: &str, default: u64, maximum: u64) -> Result<u64, String> {
+    let value = options
+        .get(key)
+        .map(|value| {
+            value
+                .as_u64()
+                .ok_or_else(|| format!("{key} must be an integer"))
+        })
+        .transpose()?
+        .unwrap_or(default);
+    if !(MIN_HORIZON_DAYS..=maximum).contains(&value) {
+        return Err(format!(
+            "{key} must be between {MIN_HORIZON_DAYS} and {maximum} days"
+        ));
+    }
+    Ok(value)
+}
+
 fn query_local_signals(
     connection: &Connection,
     urlmd5s: &[String],
@@ -517,6 +654,7 @@ fn handle(provider: &mut LibrarySignalsState, request: GuidanceRequest) -> Guida
         }
         GuidanceRequest::Prepare {
             spi_version,
+            options,
             artifacts,
             resources,
             ..
@@ -524,7 +662,7 @@ fn handle(provider: &mut LibrarySignalsState, request: GuidanceRequest) -> Guida
             if spi_version != SPI_VERSION {
                 return unsupported_version();
             }
-            match provider.prepare(&artifacts, &resources) {
+            match provider.prepare_with_options(&options, &artifacts, &resources) {
                 Ok((snapshot_id, diagnostics)) => GuidanceResponse::Prepared {
                     provider_id: PROVIDER_ID.to_owned(),
                     snapshot_id,
@@ -684,7 +822,7 @@ mod tests {
         let path = fixture_path("sqlite");
         let connection = Connection::open(&path).unwrap();
         connection.execute_batch(
-            "CREATE TABLE tracks_persistent (urlmd5 TEXT PRIMARY KEY, playCount INTEGER, lastPlayed INTEGER, added INTEGER);",
+            "PRAGMA journal_mode=WAL; CREATE TABLE tracks_persistent (urlmd5 TEXT PRIMARY KEY, playCount INTEGER, lastPlayed INTEGER, added INTEGER);",
         ).unwrap();
         for (urlmd5, playcount, last_played, added) in rows {
             connection
@@ -789,7 +927,15 @@ mod tests {
         ]);
         let mut provider = LibrarySignalsState::default();
         provider
-            .prepare(&[descriptor], &[persist_resource(&database)])
+            .prepare_with_options(
+                &serde_json::json!({
+                    "as_of_unix_seconds": 10_000,
+                    "last_played_horizon_days": 30,
+                    "library_age_horizon_days": 30,
+                }),
+                &[descriptor],
+                &[persist_resource(&database)],
+            )
             .unwrap();
         let GuidanceResponse::Scores { signals, .. } = provider.score(
             "score",
@@ -814,6 +960,70 @@ mod tests {
                 < values[&("recent-new".to_owned(), "library_age".to_owned())]
         );
         assert!(!values.contains_key(&("missing".to_owned(), "playcount".to_owned())));
+        let _ = fs::remove_file(artifact);
+        let _ = fs::remove_file(database);
+    }
+
+    #[test]
+    fn frozen_time_options_match_lab_semantics_and_keep_the_sqlite_snapshot() {
+        let as_of = 10_000_000_u64;
+        let stale = as_of - (60 * 86_400);
+        let database = library_signal_fixture_database(&[
+            ("never", 0, Some(0), Some(0)),
+            ("future", 4, Some(as_of + 60), Some(as_of + 60)),
+            ("later", 7, Some(stale), Some(stale)),
+        ]);
+        let (artifact, descriptor) = identity_artifact(&[
+            ("never", "never"),
+            ("future", "future"),
+            ("later", "later"),
+            ("missing", "missing"),
+        ]);
+        let mut provider = LibrarySignalsState::default();
+        provider
+            .prepare_with_options(
+                &serde_json::json!({
+                    "as_of_unix_seconds": as_of,
+                    "last_played_horizon_days": 30,
+                    "library_age_horizon_days": 30,
+                }),
+                &[descriptor],
+                &[persist_resource(&database)],
+            )
+            .unwrap();
+
+        Connection::open(&database)
+            .unwrap()
+            .execute(
+                "UPDATE tracks_persistent SET lastPlayed = ?1, added = ?1 WHERE urlmd5 = 'later'",
+                params![as_of],
+            )
+            .unwrap();
+
+        let GuidanceResponse::Scores { signals, .. } = provider.score(
+            "score",
+            &[
+                candidate("never", "never"),
+                candidate("future", "future"),
+                candidate("later", "later"),
+                candidate("missing", "missing"),
+            ],
+        ) else {
+            panic!("expected score response");
+        };
+        let values = signals
+            .into_iter()
+            .map(|signal| ((signal.candidate_id, signal.channel), signal.score))
+            .collect::<BTreeMap<_, _>>();
+
+        assert_eq!(values[&("never".into(), "last_played".into())], -1.0);
+        assert!(!values.contains_key(&("never".into(), "library_age".into())));
+        assert_eq!(values[&("future".into(), "last_played".into())], 1.0);
+        assert_eq!(values[&("future".into(), "library_age".into())], 1.0);
+        assert!(values[&("later".into(), "last_played".into())] < 0.0);
+        assert!(values[&("later".into(), "library_age".into())] < 0.0);
+        assert!(!values.contains_key(&("missing".into(), "playcount".into())));
+
         let _ = fs::remove_file(artifact);
         let _ = fs::remove_file(database);
     }

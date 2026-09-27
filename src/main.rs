@@ -202,6 +202,7 @@ impl LibrarySignalsState {
         }
     }
 
+    #[cfg(test)]
     fn prepare(
         &mut self,
         artifacts: &[ArtifactDescriptor],

@@ -416,8 +416,8 @@ impl LibrarySignalsState {
                         )?,
                         confidence: 1.0,
                         rationale: Some(format!(
-                            "Lyrion last-played signal with frozen as_of {} and {}-day horizon",
-                            time_options.as_of_unix_seconds, time_options.last_played_horizon_days,
+                            "Lyrion last-played signal ({}-day horizon)",
+                            time_options.last_played_horizon_days,
                         )),
                         observed_at: None,
                     }
@@ -439,8 +439,7 @@ impl LibrarySignalsState {
                             score: signal,
                             confidence: 1.0,
                             rationale: Some(format!(
-                                "Lyrion library-age signal with frozen as_of {} and {}-day horizon",
-                                time_options.as_of_unix_seconds,
+                                "Lyrion library-age signal ({}-day horizon)",
                                 time_options.library_age_horizon_days,
                             )),
                             observed_at: None,
@@ -948,6 +947,24 @@ mod tests {
         ) else {
             panic!("expected score response");
         };
+        assert_eq!(
+            signals
+                .iter()
+                .find(|signal| signal.candidate_id == "old-unplayed"
+                    && signal.channel == "last_played")
+                .and_then(|signal| signal.rationale.as_deref()),
+            Some("Lyrion last-played signal (30-day horizon)"),
+            "human-facing provenance omits the internal frozen reference timestamp",
+        );
+        assert_eq!(
+            signals
+                .iter()
+                .find(|signal| signal.candidate_id == "old-unplayed"
+                    && signal.channel == "library_age")
+                .and_then(|signal| signal.rationale.as_deref()),
+            Some("Lyrion library-age signal (30-day horizon)"),
+            "human-facing provenance omits the internal frozen reference timestamp",
+        );
         let values = signals
             .into_iter()
             .map(|signal| ((signal.candidate_id, signal.channel), signal.score))

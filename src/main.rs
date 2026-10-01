@@ -402,6 +402,9 @@ impl LibrarySignalsState {
                             self.playcount.percentile(values.playcount)
                         )),
                         observed_at: None,
+                        observation: Some(serde_json::json!({
+                            "playcount": values.playcount,
+                        })),
                     }
                     .bounded(),
                     GuidanceSignal {
@@ -420,32 +423,38 @@ impl LibrarySignalsState {
                             time_options.last_played_horizon_days,
                         )),
                         observed_at: None,
+                        observation: Some(serde_json::json!({
+                            "last_played": values.last_played,
+                        })),
                     }
                     .bounded(),
                 ];
-                if let Some(signal) = values.library_age.and_then(|added| {
-                    saturating_time_signal(
+                if let Some(added) = values.library_age {
+                    if let Some(signal) = saturating_time_signal(
                         i64::try_from(added).ok(),
                         time_options.as_of_unix_seconds,
                         time_options.library_age_horizon_seconds(),
                         false,
-                    )
-                }) {
-                    signals.push(
-                        GuidanceSignal {
-                            candidate_id: candidate.candidate_id.clone(),
-                            channel: "library_age".to_owned(),
-                            scope: GuidanceScope::Global,
-                            score: signal,
-                            confidence: 1.0,
-                            rationale: Some(format!(
-                                "Lyrion library-age signal ({}-day horizon)",
-                                time_options.library_age_horizon_days,
-                            )),
-                            observed_at: None,
-                        }
-                        .bounded(),
-                    );
+                    ) {
+                        signals.push(
+                            GuidanceSignal {
+                                candidate_id: candidate.candidate_id.clone(),
+                                channel: "library_age".to_owned(),
+                                scope: GuidanceScope::Global,
+                                score: signal,
+                                confidence: 1.0,
+                                rationale: Some(format!(
+                                    "Lyrion library-age signal ({}-day horizon)",
+                                    time_options.library_age_horizon_days,
+                                )),
+                                observed_at: None,
+                                observation: Some(serde_json::json!({
+                                    "added": added,
+                                })),
+                            }
+                            .bounded(),
+                        );
+                    }
                 }
                 Some(signals)
             })
@@ -955,6 +964,16 @@ mod tests {
                 .and_then(|signal| signal.rationale.as_deref()),
             Some("Lyrion last-played signal (30-day horizon)"),
             "human-facing provenance omits the internal frozen reference timestamp",
+        );
+        assert_eq!(
+            signals
+                .iter()
+                .find(|signal| signal.candidate_id == "recent-new" && signal.channel == "playcount")
+                .and_then(|signal| signal.observation.as_ref())
+                .and_then(|observation| observation.get("playcount"))
+                .and_then(|value| value.as_u64()),
+            Some(12),
+            "play-count signal retains the raw observation for host presentation",
         );
         assert_eq!(
             signals

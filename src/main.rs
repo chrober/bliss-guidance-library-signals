@@ -52,12 +52,54 @@ struct CandidateIdentity {
 
 #[derive(Clone, Default)]
 struct LocalSignals {
-    playcount: u64,
+    playcount: Option<u64>,
     /// A null or zero value means that Lyrion has not recorded a play yet.
-    last_played: u64,
+    last_played: Option<u64>,
     /// `added` is nullable in Lyrion's persist database.  A missing value is
     /// deliberately neutral rather than being guessed as either old or new.
     library_age: Option<u64>,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum ListeningHistorySource {
+    #[default]
+    Lyrion,
+    AlternativePlayCount,
+}
+
+impl ListeningHistorySource {
+    fn parse(options: &Value) -> Result<Self, String> {
+        let source = options
+            .get("listening_history_source")
+            .map(|value| {
+                value
+                    .as_str()
+                    .ok_or_else(|| "listening_history_source must be a string".to_owned())
+            })
+            .transpose()?
+            .unwrap_or("lyrion");
+        match source {
+            "lyrion" => Ok(Self::Lyrion),
+            "alternative_play_count" => Ok(Self::AlternativePlayCount),
+            _ => {
+                Err("listening_history_source must be lyrion or alternative_play_count".to_owned())
+            }
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Lyrion => "lyrion",
+            Self::AlternativePlayCount => "alternative_play_count",
+        }
+    }
+
+    fn display_name(self) -> &'static str {
+        match self {
+            Self::Lyrion => "Lyrion",
+            Self::AlternativePlayCount => "Alternative Play Count",
+        }
+    }
 }
 
 #[derive(Default)]
@@ -96,6 +138,7 @@ struct FrozenTimeOptions {
     as_of_unix_seconds: i64,
     last_played_horizon_days: u64,
     library_age_horizon_days: u64,
+    listening_history_source: ListeningHistorySource,
 }
 
 impl FrozenTimeOptions {
@@ -131,6 +174,7 @@ impl FrozenTimeOptions {
                 DEFAULT_LIBRARY_AGE_HORIZON_DAYS,
                 MAX_LIBRARY_AGE_HORIZON_DAYS,
             )?,
+            listening_history_source: ListeningHistorySource::parse(options)?,
         })
     }
 
@@ -194,6 +238,7 @@ impl LibrarySignalsState {
                 "type": "object",
                 "properties": {
                     "as_of_unix_seconds": { "type": "integer", "minimum": 0 },
+                    "listening_history_source": { "type": "string", "enum": ["lyrion", "alternative_play_count"] },
                     "last_played_horizon_days": { "type": "integer", "minimum": MIN_HORIZON_DAYS, "maximum": MAX_LAST_PLAYED_HORIZON_DAYS },
                     "library_age_horizon_days": { "type": "integer", "minimum": MIN_HORIZON_DAYS, "maximum": MAX_LIBRARY_AGE_HORIZON_DAYS }
                 },
@@ -249,6 +294,9 @@ impl LibrarySignalsState {
             .execute_batch("PRAGMA query_only = ON; BEGIN;")
             .map_err(|error| format!("cannot begin read-only SQLite snapshot: {error}"))?;
         validate_tracks_persistent(&connection)?;
+        if time_options.listening_history_source == ListeningHistorySource::AlternativePlayCount {
+            validate_alternative_play_count(&connection)?;
+        }
 
         let started = Instant::now();
         let mut playcount = SignalDistribution::default();
@@ -265,7 +313,8 @@ impl LibrarySignalsState {
                 .collect();
             max_prepare_lookup_batch = max_prepare_lookup_batch.max(urlmd5s.len());
             prepare_query_batches += batch_count(urlmd5s.len());
-            let lookup = query_local_signals(&connection, &urlmd5s)?;
+            let lookup =
+                query_local_signals(&connection, &urlmd5s, time_options.listening_history_source)?;
             for identity in identities_batch {
                 let Some(urlmd5) = identity
                     .lms_urlmd5
@@ -279,10 +328,14 @@ impl LibrarySignalsState {
                     // persistence database. Do not fabricate a ranking.
                     continue;
                 };
-                playcount.record(signals.playcount);
-                known_last_played += 1;
-                if signals.last_played == 0 {
-                    never_played += 1;
+                if let Some(playcount_value) = signals.playcount {
+                    playcount.record(playcount_value);
+                }
+                if let Some(last_played) = signals.last_played {
+                    known_last_played += 1;
+                    if last_played == 0 {
+                        never_played += 1;
+                    }
                 }
                 if let Some(added) = signals.library_age {
                     if added > 0 {
@@ -294,9 +347,10 @@ impl LibrarySignalsState {
 
         let eligible_count = identities.candidates.len() as u64;
         let snapshot_id = format!(
-            "sqlite:{}:{}",
+            "sqlite:{}:{}:{}",
             &artifact.sha256[..artifact.sha256.len().min(16)],
-            eligible_count
+            eligible_count,
+            time_options.listening_history_source.as_str(),
         );
         self.connection = Some(connection);
         self.playcount = playcount;
@@ -315,6 +369,7 @@ impl LibrarySignalsState {
                 failure_count: 0,
                 details: Some(serde_json::json!({
                     "eligible_candidates": eligible_count,
+                    "listening_history_source": time_options.listening_history_source.as_str(),
                     "known_playcounts": self.playcount.known_count,
                     "zero_playcounts": self.playcount.zero_count,
                     "known_last_played": self.known_last_played,
@@ -369,17 +424,19 @@ impl LibrarySignalsState {
             .cloned()
             .collect();
         let cache_hits = urls.len().saturating_sub(uncached.len()) as u64;
-        let fetched = match query_local_signals(connection, &uncached) {
-            Ok(fetched) => fetched,
-            Err(message) => {
-                return GuidanceResponse::Error {
-                    provider_id: Some(PROVIDER_ID.to_owned()),
-                    code: "SCORE_LOOKUP_FAILED".to_owned(),
-                    message,
-                    retryable: true,
+        let fetched =
+            match query_local_signals(connection, &uncached, time_options.listening_history_source)
+            {
+                Ok(fetched) => fetched,
+                Err(message) => {
+                    return GuidanceResponse::Error {
+                        provider_id: Some(PROVIDER_ID.to_owned()),
+                        code: "SCORE_LOOKUP_FAILED".to_owned(),
+                        message,
+                        retryable: true,
+                    }
                 }
-            }
-        };
+            };
         for urlmd5 in &uncached {
             self.cached_signals
                 .insert(urlmd5.clone(), fetched.get(urlmd5).cloned());
@@ -390,45 +447,54 @@ impl LibrarySignalsState {
             .filter_map(|candidate| {
                 let urlmd5 = candidate.lms_urlmd5.as_ref()?;
                 let values = self.cached_signals.get(urlmd5).and_then(Option::as_ref)?;
-                let mut signals = vec![
-                    GuidanceSignal {
-                        candidate_id: candidate.candidate_id.clone(),
-                        channel: "playcount".to_owned(),
-                        scope: GuidanceScope::Global,
-                        score: centered_percentile(self.playcount.percentile(values.playcount)),
-                        confidence: 1.0,
-                        rationale: Some(format!(
-                            "Lyrion play-count percentile {:.3}",
-                            self.playcount.percentile(values.playcount)
-                        )),
-                        observed_at: None,
-                        observation: Some(serde_json::json!({
-                            "playcount": values.playcount,
-                        })),
-                    }
-                    .bounded(),
-                    GuidanceSignal {
-                        candidate_id: candidate.candidate_id.clone(),
-                        channel: "last_played".to_owned(),
-                        scope: GuidanceScope::Global,
-                        score: saturating_time_signal(
-                            i64::try_from(values.last_played).ok(),
-                            time_options.as_of_unix_seconds,
-                            time_options.last_played_horizon_seconds(),
-                            true,
-                        )?,
-                        confidence: 1.0,
-                        rationale: Some(format!(
-                            "Lyrion last-played signal ({}-day horizon)",
-                            time_options.last_played_horizon_days,
-                        )),
-                        observed_at: None,
-                        observation: Some(serde_json::json!({
-                            "last_played": values.last_played,
-                        })),
-                    }
-                    .bounded(),
-                ];
+                let mut signals = Vec::new();
+                if let Some(playcount) = values.playcount {
+                    signals.push(
+                        GuidanceSignal {
+                            candidate_id: candidate.candidate_id.clone(),
+                            channel: "playcount".to_owned(),
+                            scope: GuidanceScope::Global,
+                            score: centered_percentile(self.playcount.percentile(playcount)),
+                            confidence: 1.0,
+                            rationale: Some(format!(
+                                "{} play-count percentile {:.3}",
+                                time_options.listening_history_source.display_name(),
+                                self.playcount.percentile(playcount)
+                            )),
+                            observed_at: None,
+                            observation: Some(serde_json::json!({
+                                "playcount": playcount,
+                            })),
+                        }
+                        .bounded(),
+                    );
+                }
+                if let Some(last_played) = values.last_played {
+                    signals.push(
+                        GuidanceSignal {
+                            candidate_id: candidate.candidate_id.clone(),
+                            channel: "last_played".to_owned(),
+                            scope: GuidanceScope::Global,
+                            score: saturating_time_signal(
+                                i64::try_from(last_played).ok(),
+                                time_options.as_of_unix_seconds,
+                                time_options.last_played_horizon_seconds(),
+                                true,
+                            )?,
+                            confidence: 1.0,
+                            rationale: Some(format!(
+                                "{} last-played signal ({}-day horizon)",
+                                time_options.listening_history_source.display_name(),
+                                time_options.last_played_horizon_days,
+                            )),
+                            observed_at: None,
+                            observation: Some(serde_json::json!({
+                                "last_played": last_played,
+                            })),
+                        }
+                        .bounded(),
+                    );
+                }
                 if let Some(added) = values.library_age {
                     if let Some(signal) = saturating_time_signal(
                         i64::try_from(added).ok(),
@@ -473,6 +539,7 @@ impl LibrarySignalsState {
                 failure_count: 0,
                 details: Some(serde_json::json!({
                     "eligible_candidates": self.eligible_count,
+                    "listening_history_source": time_options.listening_history_source.as_str(),
                     "known_playcounts": self.playcount.known_count,
                     "known_last_played": self.known_last_played,
                     "known_library_age": self.known_library_age,
@@ -580,6 +647,39 @@ fn validate_tracks_persistent(connection: &Connection) -> Result<(), String> {
     Ok(())
 }
 
+fn validate_alternative_play_count(connection: &Connection) -> Result<(), String> {
+    let exists: bool = connection
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'alternativeplaycount')",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|error| format!("cannot inspect alternativeplaycount schema: {error}"))?;
+    if !exists {
+        return Err("alternativeplaycount table is unavailable".to_owned());
+    }
+    let mut statement = connection
+        .prepare("PRAGMA table_info(alternativeplaycount)")
+        .map_err(|error| format!("cannot inspect alternativeplaycount columns: {error}"))?;
+    let columns = statement
+        .query_map([], |row| row.get::<_, String>(1))
+        .map_err(|error| format!("cannot read alternativeplaycount columns: {error}"))?
+        .collect::<Result<BTreeSet<_>, _>>()
+        .map_err(|error| format!("cannot decode alternativeplaycount columns: {error}"))?;
+    let normalized_columns = columns
+        .iter()
+        .map(|column| column.to_ascii_lowercase())
+        .collect::<BTreeSet<_>>();
+    for column in ["urlmd5", "playcount", "lastplayed"] {
+        if !normalized_columns.contains(column) {
+            return Err(format!(
+                "alternativeplaycount.{column} column is unavailable"
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn centered_percentile(percentile: f64) -> f64 {
     (2.0 * percentile - 1.0).clamp(-1.0, 1.0)
 }
@@ -605,6 +705,7 @@ fn horizon_option(options: &Value, key: &str, default: u64, maximum: u64) -> Res
 fn query_local_signals(
     connection: &Connection,
     urlmd5s: &[String],
+    listening_history_source: ListeningHistorySource,
 ) -> Result<HashMap<String, LocalSignals>, String> {
     let mut result = HashMap::new();
     let unique: Vec<String> = urlmd5s
@@ -617,9 +718,20 @@ fn query_local_signals(
         let placeholders = std::iter::repeat_n("?", batch.len())
             .collect::<Vec<_>>()
             .join(",");
-        let sql = format!(
-            "SELECT urlmd5, playCount, lastPlayed, added FROM tracks_persistent WHERE urlmd5 IN ({placeholders})"
-        );
+        let sql = match listening_history_source {
+            ListeningHistorySource::Lyrion => format!(
+                "SELECT urlmd5, COALESCE(playCount, 0), COALESCE(lastPlayed, 0), added FROM tracks_persistent WHERE urlmd5 IN ({placeholders})"
+            ),
+            ListeningHistorySource::AlternativePlayCount => format!(
+                "SELECT tp.urlmd5,
+                        CASE WHEN apc.urlmd5 IS NULL THEN NULL ELSE COALESCE(apc.playCount, 0) END,
+                        CASE WHEN apc.urlmd5 IS NULL THEN NULL ELSE COALESCE(apc.lastPlayed, 0) END,
+                        tp.added
+                   FROM tracks_persistent tp
+                   LEFT JOIN alternativeplaycount apc ON apc.urlmd5 = tp.urlmd5
+                  WHERE tp.urlmd5 IN ({placeholders})"
+            ),
+        };
         let mut statement = connection
             .prepare(&sql)
             .map_err(|error| format!("cannot prepare Lyrion library-signal query: {error}"))?;
@@ -632,8 +744,8 @@ fn query_local_signals(
                 Ok((
                     row.get::<_, String>(0)?,
                     LocalSignals {
-                        playcount: non_negative(1)?.unwrap_or(0),
-                        last_played: non_negative(2)?.unwrap_or(0),
+                        playcount: non_negative(1)?,
+                        last_played: non_negative(2)?,
                         library_age: non_negative(3)?,
                     },
                 ))
@@ -922,6 +1034,137 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["playcount", "last_played", "library_age"],
         );
+        assert_eq!(
+            manifest.configuration_schema.as_ref().unwrap()["properties"]
+                ["listening_history_source"]["enum"],
+            serde_json::json!(["lyrion", "alternative_play_count"]),
+        );
+    }
+
+    #[test]
+    fn alternative_play_count_replaces_listening_history_but_not_library_age() {
+        let database = fixture_path("sqlite");
+        let connection = Connection::open(&database).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE tracks_persistent (urlmd5 TEXT PRIMARY KEY, playCount INTEGER, lastPlayed INTEGER, added INTEGER);
+                 CREATE TABLE alternativeplaycount (urlmd5 TEXT PRIMARY KEY, playCount INTEGER, lastPlayed INTEGER);
+                 INSERT INTO tracks_persistent(urlmd5, playCount, lastPlayed, added) VALUES
+                    ('low-native', 1, 100, 1000),
+                    ('high-native', 20, 900, 9000),
+                    ('missing-apc', 7, 700, 7000);
+                 INSERT INTO alternativeplaycount(urlmd5, playCount, lastPlayed) VALUES
+                    ('low-native', 30, 950),
+                    ('high-native', 2, 200);",
+            )
+            .unwrap();
+        let (artifact, descriptor) = identity_artifact(&[
+            ("low-native", "low-native"),
+            ("high-native", "high-native"),
+            ("missing-apc", "missing-apc"),
+        ]);
+        let mut provider = LibrarySignalsState::default();
+        let (_, diagnostics) = provider
+            .prepare_with_options(
+                &serde_json::json!({
+                    "as_of_unix_seconds": 10_000,
+                    "last_played_horizon_days": 30,
+                    "library_age_horizon_days": 30,
+                    "listening_history_source": "alternative_play_count",
+                }),
+                &[descriptor],
+                &[persist_resource(&database)],
+            )
+            .unwrap();
+        assert_eq!(
+            diagnostics.details.as_ref().unwrap()["listening_history_source"],
+            "alternative_play_count",
+        );
+
+        let GuidanceResponse::Scores { signals, .. } = provider.score(
+            "score",
+            &[
+                candidate("low-native", "low-native"),
+                candidate("high-native", "high-native"),
+                candidate("missing-apc", "missing-apc"),
+            ],
+        ) else {
+            panic!("expected score response");
+        };
+        let observations = signals
+            .iter()
+            .map(|signal| {
+                (
+                    (signal.candidate_id.as_str(), signal.channel.as_str()),
+                    signal.observation.as_ref(),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        assert_eq!(
+            observations[&("low-native", "playcount")]
+                .and_then(|value| value["playcount"].as_u64()),
+            Some(30),
+        );
+        assert_eq!(
+            observations[&("high-native", "playcount")]
+                .and_then(|value| value["playcount"].as_u64()),
+            Some(2),
+        );
+        assert_eq!(
+            observations[&("low-native", "library_age")].and_then(|value| value["added"].as_u64()),
+            Some(1000),
+            "library age remains sourced from Lyrion",
+        );
+        assert!(
+            !observations.contains_key(&("missing-apc", "playcount")),
+            "a missing APC row is unknown rather than zero plays",
+        );
+        assert!(
+            observations.contains_key(&("missing-apc", "library_age")),
+            "a missing APC row does not discard native library age",
+        );
+        assert_eq!(
+            signals
+                .iter()
+                .find(|signal| signal.candidate_id == "low-native" && signal.channel == "playcount")
+                .and_then(|signal| signal.rationale.as_deref()),
+            Some("Alternative Play Count play-count percentile 1.000"),
+        );
+
+        let _ = fs::remove_file(artifact);
+        let _ = fs::remove_file(database);
+    }
+
+    #[test]
+    fn alternative_play_count_requires_its_table() {
+        let database = fixture_database(&[("song", 1)]);
+        let (artifact, descriptor) = identity_artifact(&[("song", "song")]);
+        let error = LibrarySignalsState::default()
+            .prepare_with_options(
+                &serde_json::json!({"listening_history_source": "alternative_play_count"}),
+                &[descriptor],
+                &[persist_resource(&database)],
+            )
+            .unwrap_err();
+        assert!(error.contains("alternativeplaycount"));
+        let _ = fs::remove_file(artifact);
+        let _ = fs::remove_file(database);
+    }
+
+    #[test]
+    fn listening_history_source_rejects_non_string_values() {
+        let database = fixture_database(&[("song", 1)]);
+        let (artifact, descriptor) = identity_artifact(&[("song", "song")]);
+        let error = LibrarySignalsState::default()
+            .prepare_with_options(
+                &serde_json::json!({"listening_history_source": 1}),
+                &[descriptor],
+                &[persist_resource(&database)],
+            )
+            .unwrap_err();
+        assert!(error.contains("listening_history_source"));
+        let _ = fs::remove_file(artifact);
+        let _ = fs::remove_file(database);
     }
     #[test]
     fn scores_last_played_and_library_age_monotonically_and_leaves_missing_rows_neutral() {

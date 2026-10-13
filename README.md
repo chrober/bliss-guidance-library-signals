@@ -12,19 +12,27 @@ similarity, eligibility, repeat windows, and route validity.
 | `last_played` | `tracks_persistent.lastPlayed` | longer-unheard or recently played tracks |
 | `library_age` | `tracks_persistent.added` | older or newer library additions |
 
-The provider is started by a compatible host such as
+When the separately installed Alternative Play Count plugin is enabled, the
+Lyrion provider can explicitly select `alternativeplaycount.playCount` and
+`alternativeplaycount.lastPlayed` for the first two channels. Library age
+always remains sourced from `tracks_persistent.added`. Missing APC rows are
+neutral for APC-derived signals rather than being treated as zero plays.
+
+The provider is started by a compatible native guidance host such as
 [bliss-playlist-optimizer](https://github.com/chrober/bliss-playlist-optimizer),
-not by Lyrion directly. Better Call Bliss supplies a trusted, read-only
-`persist.db` descriptor and the frozen eligible candidate identities. The
-provider never uses or requires Alternative Play Count (APC); APC-based
-guidance is intentionally future, separate work.
+not by Lyrion directly. The separately installed
+[Lyrion provider plugin](https://github.com/chrober/lms-guidance-library-signals)
+supplies a trusted, read-only `persist.db` descriptor and the frozen eligible
+candidate identities. The provider does not require Alternative Play Count
+(APC). APC-specific skip, last-skipped, DPSV, and detailed-history guidance
+remains separate future work.
 
 ```mermaid
 flowchart LR
-    B[Better Call Bliss] -->|frozen eligible identities + read-only persist.db| O[bliss-playlist-optimizer]
-    O -->|prepare and shortlist score requests| P[Library signals provider]
-    P -->|playcount, last_played, library_age| O
-    O -->|Bliss-first route with guidance provenance| B
+    L[Lyrion provider plugin] -->|source option + trusted resources| H[Compatible native guidance host]
+    H -->|prepare and bounded score requests| P[Library signals provider]
+    D[(persist.db)] -->|tracks_persistent + optional alternativeplaycount| P
+    P -->|playcount, last_played, library_age| H
 ```
 
 At preparation, the provider verifies the identity artifact, opens one

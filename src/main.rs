@@ -100,6 +100,14 @@ impl ListeningHistorySource {
             Self::AlternativePlayCount => "Alternative Play Count",
         }
     }
+
+    fn source_by_channel(self) -> Value {
+        serde_json::json!({
+            "playcount": self.as_str(),
+            "last_played": self.as_str(),
+            "library_age": "lyrion",
+        })
+    }
 }
 
 #[derive(Default)]
@@ -370,6 +378,7 @@ impl LibrarySignalsState {
                 details: Some(serde_json::json!({
                     "eligible_candidates": eligible_count,
                     "listening_history_source": time_options.listening_history_source.as_str(),
+                    "source_by_channel": time_options.listening_history_source.source_by_channel(),
                     "known_playcounts": self.playcount.known_count,
                     "zero_playcounts": self.playcount.zero_count,
                     "known_last_played": self.known_last_played,
@@ -540,6 +549,7 @@ impl LibrarySignalsState {
                 details: Some(serde_json::json!({
                     "eligible_candidates": self.eligible_count,
                     "listening_history_source": time_options.listening_history_source.as_str(),
+                    "source_by_channel": time_options.listening_history_source.source_by_channel(),
                     "known_playcounts": self.playcount.known_count,
                     "known_last_played": self.known_last_played,
                     "known_library_age": self.known_library_age,
@@ -1080,17 +1090,40 @@ mod tests {
             diagnostics.details.as_ref().unwrap()["listening_history_source"],
             "alternative_play_count",
         );
+        assert_eq!(
+            diagnostics.details.as_ref().unwrap()["source_by_channel"],
+            serde_json::json!({
+                "playcount": "alternative_play_count",
+                "last_played": "alternative_play_count",
+                "library_age": "lyrion",
+            }),
+            "provider diagnostics expose the effective source for every channel",
+        );
 
-        let GuidanceResponse::Scores { signals, .. } = provider.score(
+        let GuidanceResponse::Scores {
+            signals,
+            diagnostics: score_diagnostics,
+            ..
+        } = provider.score(
             "score",
             &[
                 candidate("low-native", "low-native"),
                 candidate("high-native", "high-native"),
                 candidate("missing-apc", "missing-apc"),
             ],
-        ) else {
+        )
+        else {
             panic!("expected score response");
         };
+        assert_eq!(
+            score_diagnostics.details.as_ref().unwrap()["source_by_channel"],
+            serde_json::json!({
+                "playcount": "alternative_play_count",
+                "last_played": "alternative_play_count",
+                "library_age": "lyrion",
+            }),
+            "score diagnostics preserve the per-channel source provenance",
+        );
         let observations = signals
             .iter()
             .map(|signal| {

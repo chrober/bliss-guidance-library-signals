@@ -17,6 +17,9 @@ Lyrion provider can explicitly select `alternativeplaycount.playCount` and
 `alternativeplaycount.lastPlayed` for the first two channels. Library age
 always remains sourced from `tracks_persistent.added`. Missing APC rows are
 neutral for APC-derived signals rather than being treated as zero plays.
+Prepare and score diagnostics expose the effective source for each channel in
+`source_by_channel`, allowing hosts to report provenance without changing
+their established selection-log formats.
 
 The provider is started by a compatible native guidance host such as
 [bliss-playlist-optimizer](https://github.com/chrober/bliss-playlist-optimizer),

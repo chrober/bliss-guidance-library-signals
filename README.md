@@ -51,3 +51,15 @@ zero `added` values, remain neutral rather than receiving invented ranks.
 See the [SPI contract](https://github.com/chrober/bliss-playlist-guidance-spi)
 for the host-neutral JSONL protocol and the optimizer repository for the
 host-side orchestration.
+
+## Diagnostics
+
+The trusted `diagnostic_level` prepare option selects `warning`, `info`, or
+`debug` event production. Information events report candidate counts,
+effective per-channel sources, and known-value coverage. Debug events add the
+sanitized prepare request, read-only database query/cache statistics, the
+prepared result summary, and score-batch counts.
+
+These are bounded `guidance_log_event_v1` objects in ordinary SPI diagnostics,
+not free-form native output. The owning Lyrion provider renders them; scoring
+remains network-free and a logging failure is always neutral.

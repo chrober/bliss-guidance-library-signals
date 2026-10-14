@@ -25,6 +25,36 @@ const MAX_LAST_PLAYED_HORIZON_DAYS: u64 = 1_825;
 const MAX_LIBRARY_AGE_HORIZON_DAYS: u64 = 3_650;
 const DEFAULT_LAST_PLAYED_HORIZON_DAYS: u64 = 180;
 const DEFAULT_LIBRARY_AGE_HORIZON_DAYS: u64 = 365;
+const MAX_LOG_EVENTS: usize = 64;
+
+fn diagnostic_level(options: &Value) -> &str {
+    options
+        .get("diagnostic_level")
+        .and_then(Value::as_str)
+        .filter(|value| matches!(*value, "warning" | "info" | "debug"))
+        .unwrap_or("warning")
+}
+
+fn provider_log_event(
+    level: &str,
+    phase: &str,
+    event: &str,
+    result_count: Option<usize>,
+    details: Option<Value>,
+) -> Value {
+    serde_json::json!({
+        "event_version": "guidance_log_event_v1",
+        "level": level,
+        "phase": phase,
+        "event": event,
+        "provider_id": PROVIDER_ID,
+        "operation": null,
+        "source": null,
+        "cache_state": null,
+        "result_count": result_count,
+        "details": details,
+    })
+}
 
 fn version_metadata_json() -> String {
     format!(
@@ -214,6 +244,7 @@ struct LibrarySignalsState {
     score_cache_hits: u64,
     snapshot_id: Option<String>,
     prepared: bool,
+    diagnostic_level: String,
 }
 
 impl LibrarySignalsState {
@@ -249,6 +280,7 @@ impl LibrarySignalsState {
                     "listening_history_source": { "type": "string", "enum": ["lyrion", "alternative_play_count"] },
                     "last_played_horizon_days": { "type": "integer", "minimum": MIN_HORIZON_DAYS, "maximum": MAX_LAST_PLAYED_HORIZON_DAYS },
                     "library_age_horizon_days": { "type": "integer", "minimum": MIN_HORIZON_DAYS, "maximum": MAX_LIBRARY_AGE_HORIZON_DAYS }
+                    ,"diagnostic_level": { "type": "string", "enum": ["warning", "info", "debug"] }
                 },
                 "additionalProperties": false
             })),
@@ -271,6 +303,7 @@ impl LibrarySignalsState {
         resources: &[ResourceDescriptor],
     ) -> Result<(Option<String>, Diagnostics), String> {
         self.reset();
+        self.diagnostic_level = diagnostic_level(options).to_owned();
         let time_options = FrozenTimeOptions::parse(options)?;
         let artifact = required_artifact(artifacts, "eligible-candidate-identities-v1")?;
         let bytes = verified_artifact_bytes(artifact)?;
@@ -369,6 +402,75 @@ impl LibrarySignalsState {
         self.eligible_count = eligible_count;
         self.snapshot_id = Some(snapshot_id.clone());
         self.prepared = true;
+        let mut log_events = Vec::new();
+        if matches!(self.diagnostic_level.as_str(), "info" | "debug") {
+            log_events.push(provider_log_event(
+                "info",
+                "prepare",
+                "library_signals_prepare_started",
+                Some(identities.candidates.len()),
+                Some(serde_json::json!({"candidates": identities.candidates.len()})),
+            ));
+            log_events.push(provider_log_event(
+                "info",
+                "prepare",
+                "library_signals_sources",
+                None,
+                Some(serde_json::json!({
+                    "source_by_channel": time_options.listening_history_source.source_by_channel(),
+                })),
+            ));
+            log_events.push(provider_log_event(
+                "info",
+                "prepare",
+                "library_signals_prepared",
+                Some(eligible_count as usize),
+                Some(serde_json::json!({
+                    "known_playcounts": self.playcount.known_count,
+                    "known_last_played": self.known_last_played,
+                    "known_library_age": self.known_library_age,
+                })),
+            ));
+        }
+        if self.diagnostic_level == "debug" && log_events.len() < MAX_LOG_EVENTS {
+            log_events.push(provider_log_event(
+                "debug",
+                "prepare",
+                "library_signals_request_json",
+                None,
+                Some(serde_json::json!({
+                    "request": {
+                        "candidates": identities.candidates.len(),
+                        "listening_history_source": time_options.listening_history_source.as_str(),
+                        "last_played_horizon_days": time_options.last_played_horizon_days,
+                        "library_age_horizon_days": time_options.library_age_horizon_days,
+                    }
+                })),
+            ));
+            log_events.push(provider_log_event(
+                "debug",
+                "prepare",
+                "library_signals_database_lookup",
+                None,
+                Some(serde_json::json!({
+                    "queried": identities.candidates.len(),
+                    "cached": 0,
+                    "batches": prepare_query_batches,
+                    "elapsed_ms": started.elapsed().as_millis(),
+                })),
+            ));
+            log_events.push(provider_log_event(
+                "debug", "prepare", "library_signals_result_json", None,
+                Some(serde_json::json!({
+                    "result": {
+                        "known_playcounts": self.playcount.known_count,
+                        "known_last_played": self.known_last_played,
+                        "known_library_age": self.known_library_age,
+                        "source_by_channel": time_options.listening_history_source.source_by_channel(),
+                    }
+                })),
+            ));
+        }
         Ok((
             Some(snapshot_id),
             Diagnostics {
@@ -391,6 +493,7 @@ impl LibrarySignalsState {
                     "prepare_query_batches": prepare_query_batches,
                     "max_prepare_lookup_batch": max_prepare_lookup_batch,
                     "elapsed_ms": started.elapsed().as_millis(),
+                    "log_events_v1": log_events,
                 })),
             },
         ))
@@ -538,6 +641,24 @@ impl LibrarySignalsState {
         self.score_batches += 1;
         self.score_query_batches += batch_count(uncached.len());
         self.score_cache_hits += cache_hits;
+        let log_events = if self.diagnostic_level == "debug" {
+            vec![provider_log_event(
+                "debug",
+                "score",
+                "library_signals_scored",
+                Some(signals.len()),
+                Some(serde_json::json!({
+                    "candidates": candidates.len(),
+                    "signals": signals.len(),
+                    "queried": uncached.len(),
+                    "cached": cache_hits,
+                    "batches": batch_count(uncached.len()),
+                    "elapsed_ms": started.elapsed().as_millis(),
+                })),
+            )]
+        } else {
+            Vec::new()
+        };
         GuidanceResponse::Scores {
             provider_id: PROVIDER_ID.to_owned(),
             request_id: request_id.to_owned(),
@@ -562,6 +683,7 @@ impl LibrarySignalsState {
                     "total_score_query_batches": self.score_query_batches,
                     "total_cache_hits": self.score_cache_hits,
                     "elapsed_ms": started.elapsed().as_millis(),
+                    "log_events_v1": log_events,
                 })),
             },
         }
@@ -1081,6 +1203,7 @@ mod tests {
                     "last_played_horizon_days": 30,
                     "library_age_horizon_days": 30,
                     "listening_history_source": "alternative_play_count",
+                    "diagnostic_level": "debug",
                 }),
                 &[descriptor],
                 &[persist_resource(&database)],
@@ -1090,6 +1213,18 @@ mod tests {
             diagnostics.details.as_ref().unwrap()["listening_history_source"],
             "alternative_play_count",
         );
+        let prepare_events = diagnostics.details.as_ref().unwrap()["log_events_v1"]
+            .as_array()
+            .expect("prepare log events");
+        assert!(prepare_events
+            .iter()
+            .any(|event| event["event"] == "library_signals_prepare_started"));
+        assert!(prepare_events
+            .iter()
+            .any(|event| event["event"] == "library_signals_prepared"));
+        assert!(prepare_events
+            .iter()
+            .any(|event| event["event"] == "library_signals_result_json"));
         assert_eq!(
             diagnostics.details.as_ref().unwrap()["source_by_channel"],
             serde_json::json!({
@@ -1099,7 +1234,6 @@ mod tests {
             }),
             "provider diagnostics expose the effective source for every channel",
         );
-
         let GuidanceResponse::Scores {
             signals,
             diagnostics: score_diagnostics,
@@ -1124,6 +1258,11 @@ mod tests {
             }),
             "score diagnostics preserve the per-channel source provenance",
         );
+        assert!(score_diagnostics.details.as_ref().unwrap()["log_events_v1"]
+            .as_array()
+            .expect("score log events")
+            .iter()
+            .any(|event| event["event"] == "library_signals_scored"));
         let observations = signals
             .iter()
             .map(|signal| {

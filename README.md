@@ -63,3 +63,11 @@ prepared result summary, and score-batch counts.
 These are bounded `guidance_log_event_v1` objects in ordinary SPI diagnostics,
 not free-form native output. The owning Lyrion provider renders them; scoring
 remains network-free and a logging failure is always neutral.
+
+## Source snapshots
+
+The release workflow builds a source snapshot from its exact Git commit and
+vendors the locked Cargo dependencies. After unpacking, run
+`cargo build --locked --offline` from `source/` with the required Rust and platform build
+tools installed. `SOURCE_MANIFEST.json` lists dependency metadata and available
+notice files; it is not a legal review. Existing releases may predate this step.

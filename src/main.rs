@@ -1,5 +1,9 @@
 // SPDX-License-Identifier: GPL-3.0-only
 
+use bliss_guidance_library_signals::{
+    accumulate_selected_attached_catalogue, candidate_groups_attached, ArtistIdentity,
+    HistoryAccumulator, HistoryTotal, ListeningSource,
+};
 use bliss_playlist_guidance_spi::policy::{saturating_time_signal, HostPolicyKind};
 use bliss_playlist_guidance_spi::{
     encode, ArtifactDescriptor, Candidate, Capability, ChannelDescriptor, Diagnostics,
@@ -12,7 +16,7 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs;
-use std::io::{self, BufRead, Write};
+use std::io::{self, BufRead, Read, Write};
 use std::time::{Duration, Instant};
 
 const PROVIDER_ID: &str = "library-signals-guidance";
@@ -232,6 +236,12 @@ impl FrozenTimeOptions {
 #[derive(Default)]
 struct LibrarySignalsState {
     connection: Option<Connection>,
+    aggregate_totals: Option<HistoryAccumulator>,
+    aggregate_identity: Option<ArtistIdentity>,
+    aggregate_scope: Option<&'static str>,
+    omit_artist_aggregates: bool,
+    album_playcounts: SignalDistribution,
+    artist_playcounts: SignalDistribution,
     playcount: SignalDistribution,
     known_last_played: u64,
     never_played: u64,
@@ -271,6 +281,26 @@ impl LibrarySignalsState {
                     scopes: vec![GuidanceScope::Global],
                     supported_host_policies: vec![HostPolicyKind::BoundedInfluence],
                 },
+                ChannelDescriptor {
+                    channel: "album_playcount".to_owned(),
+                    scopes: vec![GuidanceScope::Global],
+                    supported_host_policies: vec![HostPolicyKind::BoundedInfluence],
+                },
+                ChannelDescriptor {
+                    channel: "artist_playcount".to_owned(),
+                    scopes: vec![GuidanceScope::Global],
+                    supported_host_policies: vec![HostPolicyKind::BoundedInfluence],
+                },
+                ChannelDescriptor {
+                    channel: "album_last_played".to_owned(),
+                    scopes: vec![GuidanceScope::Global],
+                    supported_host_policies: vec![HostPolicyKind::BoundedInfluence],
+                },
+                ChannelDescriptor {
+                    channel: "artist_last_played".to_owned(),
+                    scopes: vec![GuidanceScope::Global],
+                    supported_host_policies: vec![HostPolicyKind::BoundedInfluence],
+                },
             ],
             required_context: vec!["candidate_identity".to_owned()],
             configuration_schema: Some(serde_json::json!({
@@ -278,6 +308,8 @@ impl LibrarySignalsState {
                 "properties": {
                     "as_of_unix_seconds": { "type": "integer", "minimum": 0 },
                     "listening_history_source": { "type": "string", "enum": ["lyrion", "alternative_play_count"] },
+                    "aggregate_identity_mode": { "type": "string", "enum": ["shared_artist", "primary_artist", "exact_bliss_credit"] },
+                    "omit_artist_aggregates": { "type": "integer", "minimum": 0, "maximum": 1 },
                     "last_played_horizon_days": { "type": "integer", "minimum": MIN_HORIZON_DAYS, "maximum": MAX_LAST_PLAYED_HORIZON_DAYS },
                     "library_age_horizon_days": { "type": "integer", "minimum": MIN_HORIZON_DAYS, "maximum": MAX_LIBRARY_AGE_HORIZON_DAYS }
                     ,"diagnostic_level": { "type": "string", "enum": ["warning", "info", "debug"] }
@@ -302,9 +334,16 @@ impl LibrarySignalsState {
         artifacts: &[ArtifactDescriptor],
         resources: &[ResourceDescriptor],
     ) -> Result<(Option<String>, Diagnostics), String> {
+        let started = Instant::now();
         self.reset();
         self.diagnostic_level = diagnostic_level(options).to_owned();
         let time_options = FrozenTimeOptions::parse(options)?;
+        let omit_artist_aggregates = match options.get("omit_artist_aggregates") {
+            None => false,
+            Some(value) if value.as_u64() == Some(0) => false,
+            Some(value) if value.as_u64() == Some(1) => true,
+            Some(_) => return Err("omit_artist_aggregates must be 0 or 1".to_owned()),
+        };
         let artifact = required_artifact(artifacts, "eligible-candidate-identities-v1")?;
         let bytes = verified_artifact_bytes(artifact)?;
         let identities: IdentityArtifact = serde_json::from_slice(&bytes)
@@ -325,12 +364,60 @@ impl LibrarySignalsState {
         let resource = required_read_only_resource(resources, "lms-persist-sqlite-v1")?;
         let connection = Connection::open_with_flags(
             &resource.path,
-            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+            OpenFlags::SQLITE_OPEN_READ_ONLY
+                | OpenFlags::SQLITE_OPEN_NO_MUTEX
+                | OpenFlags::SQLITE_OPEN_URI,
         )
         .map_err(|error| format!("cannot open Lyrion persist database read-only: {error}"))?;
         connection
             .busy_timeout(Duration::from_secs(2))
             .map_err(|error| format!("cannot set SQLite busy timeout: {error}"))?;
+        let aggregate_identity = match options.get("aggregate_identity_mode") {
+            None => None,
+            Some(value) => {
+                let identity = match value.as_str() {
+                    Some("shared_artist") => ArtistIdentity::SharedArtist,
+                    Some("primary_artist") => ArtistIdentity::PrimaryArtist,
+                    Some("exact_bliss_credit") => ArtistIdentity::ExactBlissCredit,
+                    _ => {
+                        return Err(
+                            "aggregate_identity_mode must be shared_artist, primary_artist, or exact_bliss_credit"
+                                .to_owned(),
+                        )
+                    }
+                };
+                let catalogue = required_read_only_resource(resources, "lms-catalogue-sqlite-v1")?;
+                let uri = read_only_sqlite_uri(&catalogue.path)?;
+                connection
+                    .execute("ATTACH DATABASE ?1 AS catalogue", [&uri])
+                    .map_err(|error| format!("cannot attach read-only catalogue: {error}"))?;
+                if identity == ArtistIdentity::ExactBlissCredit {
+                    let identity_artifact =
+                        required_artifact(artifacts, "lyrion-track-identities-v1")?;
+                    verify_artifact_file(identity_artifact)?;
+                    for (kind, alias) in [
+                        ("lyrion-track-identities-sqlite-v1", "identities"),
+                        ("bliss-analysis-sqlite-v1", "bliss"),
+                    ] {
+                        let resource = required_read_only_resource(resources, kind)?;
+                        if alias == "identities"
+                            && fs::canonicalize(&resource.path).ok()
+                                != fs::canonicalize(&identity_artifact.path).ok()
+                        {
+                            return Err(
+                                "identity snapshot resource does not match its verified artifact"
+                                    .to_owned(),
+                            );
+                        }
+                        let uri = read_only_sqlite_uri(&resource.path)?;
+                        connection
+                            .execute(&format!("ATTACH DATABASE ?1 AS {alias}"), [&uri])
+                            .map_err(|error| format!("cannot attach read-only {kind}: {error}"))?;
+                    }
+                }
+                Some(identity)
+            }
+        };
         connection
             .execute_batch("PRAGMA query_only = ON; BEGIN;")
             .map_err(|error| format!("cannot begin read-only SQLite snapshot: {error}"))?;
@@ -338,8 +425,27 @@ impl LibrarySignalsState {
         if time_options.listening_history_source == ListeningHistorySource::AlternativePlayCount {
             validate_alternative_play_count(&connection)?;
         }
+        let aggregate = match aggregate_identity {
+            None => None,
+            Some(identity) => {
+                let source = match time_options.listening_history_source {
+                    ListeningHistorySource::Lyrion => ListeningSource::Lyrion,
+                    ListeningHistorySource::AlternativePlayCount => {
+                        ListeningSource::AlternativePlayCount
+                    }
+                };
+                let urls: Vec<String> = identities
+                    .candidates
+                    .iter()
+                    .filter_map(|candidate| candidate.lms_urlmd5.clone())
+                    .collect();
+                let totals =
+                    accumulate_selected_attached_catalogue(&connection, source, identity, &urls)
+                        .map_err(|error| format!("cannot aggregate listening history: {error}"))?;
+                Some((totals, "candidate_groups"))
+            }
+        };
 
-        let started = Instant::now();
         let mut playcount = SignalDistribution::default();
         let mut known_last_played = 0_u64;
         let mut never_played = 0_u64;
@@ -394,6 +500,20 @@ impl LibrarySignalsState {
             time_options.listening_history_source.as_str(),
         );
         self.connection = Some(connection);
+        if let Some((totals, _)) = aggregate.as_ref() {
+            for total in totals.albums().filter(|total| total.known_playcounts > 0) {
+                self.album_playcounts.record(total.playcount_sum);
+            }
+            for total in totals.artists().filter(|total| total.known_playcounts > 0) {
+                self.artist_playcounts.record(total.playcount_sum);
+            }
+        }
+        self.aggregate_identity = aggregate_identity;
+        self.omit_artist_aggregates = omit_artist_aggregates;
+        if let Some((totals, scope)) = aggregate {
+            self.aggregate_totals = Some(totals);
+            self.aggregate_scope = Some(scope);
+        }
         self.playcount = playcount;
         self.known_last_played = known_last_played;
         self.never_played = never_played;
@@ -554,7 +674,7 @@ impl LibrarySignalsState {
                 .insert(urlmd5.clone(), fetched.get(urlmd5).cloned());
         }
 
-        let signals: Vec<GuidanceSignal> = candidates
+        let mut signals: Vec<GuidanceSignal> = candidates
             .iter()
             .filter_map(|candidate| {
                 let urlmd5 = candidate.lms_urlmd5.as_ref()?;
@@ -638,6 +758,82 @@ impl LibrarySignalsState {
             })
             .flatten()
             .collect();
+        if let (Some(totals), Some(identity)) = (&self.aggregate_totals, self.aggregate_identity) {
+            let requested: Vec<String> = urls.iter().cloned().collect();
+            let groups_result = if identity == ArtistIdentity::ExactBlissCredit {
+                Ok(totals.exact_candidate_groups(&requested))
+            } else {
+                candidate_groups_attached(connection, &requested, identity)
+            };
+            let groups = match groups_result {
+                Ok(groups) => groups,
+                Err(message) => {
+                    return GuidanceResponse::Error {
+                        provider_id: Some(PROVIDER_ID.to_owned()),
+                        code: "AGGREGATE_LOOKUP_FAILED".to_owned(),
+                        message: message.to_string(),
+                        retryable: true,
+                    }
+                }
+            };
+            for candidate in candidates {
+                let Some(groups) = candidate
+                    .lms_urlmd5
+                    .as_ref()
+                    .and_then(|url| groups.get(url))
+                else {
+                    continue;
+                };
+                let albums: Vec<&HistoryTotal> = groups
+                    .album
+                    .and_then(|id| totals.album(id))
+                    .into_iter()
+                    .collect();
+                let artists: Vec<&HistoryTotal> = groups
+                    .artists
+                    .iter()
+                    .map(|id| totals.canonical_artist(*id))
+                    .collect::<BTreeSet<_>>()
+                    .into_iter()
+                    .filter_map(|id| totals.artist(id))
+                    .collect();
+                signals.extend(aggregate_observations(
+                    &candidate.candidate_id,
+                    "album",
+                    &albums,
+                    &self.album_playcounts,
+                    time_options,
+                ));
+                if !self.omit_artist_aggregates {
+                    signals.extend(aggregate_observations(
+                        &candidate.candidate_id,
+                        "artist",
+                        &artists,
+                        &self.artist_playcounts,
+                        time_options,
+                    ));
+                }
+            }
+            for signal in &mut signals {
+                let family = match signal.channel.as_str() {
+                    "playcount" | "album_playcount" | "artist_playcount" => {
+                        Some("listening_playcount")
+                    }
+                    "last_played" | "album_last_played" | "artist_last_played" => {
+                        Some("listening_last_played")
+                    }
+                    _ => None,
+                };
+                if let (Some(family), Some(Value::Object(observation))) =
+                    (family, signal.observation.as_mut())
+                {
+                    observation.insert(
+                        "guidance_family_v1".to_owned(),
+                        Value::String(family.to_owned()),
+                    );
+                }
+            }
+        }
         self.score_batches += 1;
         self.score_query_batches += batch_count(uncached.len());
         self.score_cache_hits += cache_hits;
@@ -690,6 +886,12 @@ impl LibrarySignalsState {
     }
 
     fn reset(&mut self) {
+        self.aggregate_totals = None;
+        self.aggregate_scope = None;
+        self.aggregate_identity = None;
+        self.omit_artist_aggregates = false;
+        self.album_playcounts = SignalDistribution::default();
+        self.artist_playcounts = SignalDistribution::default();
         if let Some(connection) = self.connection.take() {
             let _ = connection.execute_batch("ROLLBACK;");
         }
@@ -706,6 +908,114 @@ impl LibrarySignalsState {
         self.snapshot_id = None;
         self.prepared = false;
     }
+}
+
+fn aggregate_observations(
+    candidate_id: &str,
+    kind: &str,
+    totals: &[&HistoryTotal],
+    distribution: &SignalDistribution,
+    time: &FrozenTimeOptions,
+) -> Vec<GuidanceSignal> {
+    let mut result = Vec::new();
+    let known_counts: Vec<_> = totals
+        .iter()
+        .filter(|total| total.known_playcounts > 0)
+        .collect();
+    let known_times: Vec<_> = totals
+        .iter()
+        .filter(|total| total.known_last_played > 0 && total.last_played.is_some())
+        .collect();
+    let render = |channel: String, score: f64, confidence: f64, selected: &[&&HistoryTotal]| {
+        let details: Vec<_> = selected.iter().map(|total| serde_json::json!({"track_count":total.track_count,"known_playcounts":total.known_playcounts,"playcount_sum":total.playcount_sum,"known_last_played":total.known_last_played,"last_played":total.last_played})).collect();
+        let mut observation = serde_json::json!({"groups":details,"group_count":totals.len()});
+        if let [total] = selected {
+            observation["track_count"] = total.track_count.into();
+            observation["playcount_sum"] = total.playcount_sum.into();
+        }
+        GuidanceSignal {
+            candidate_id: candidate_id.to_owned(),
+            channel,
+            scope: GuidanceScope::Global,
+            score,
+            confidence,
+            rationale: Some(format!(
+                "{} {kind} listening history",
+                time.listening_history_source.display_name()
+            )),
+            observed_at: None,
+            observation: Some(observation),
+        }
+        .bounded()
+    };
+    if !known_counts.is_empty() {
+        let score = known_counts
+            .iter()
+            .map(|total| centered_percentile(distribution.percentile(total.playcount_sum)))
+            .sum::<f64>()
+            / known_counts.len() as f64;
+        let coverage = known_counts
+            .iter()
+            .map(|total| total.known_playcounts as f64 / total.track_count.max(1) as f64)
+            .sum::<f64>()
+            / totals.len() as f64;
+        result.push(render(
+            format!("{kind}_playcount"),
+            score,
+            coverage,
+            &known_counts,
+        ));
+    }
+    if !known_times.is_empty() {
+        let score = known_times
+            .iter()
+            .map(|total| {
+                saturating_time_signal(
+                    total
+                        .last_played
+                        .and_then(|value| i64::try_from(value).ok()),
+                    time.as_of_unix_seconds,
+                    time.last_played_horizon_seconds(),
+                    true,
+                )
+                .unwrap_or(0.0)
+            })
+            .sum::<f64>()
+            / known_times.len() as f64;
+        let coverage = known_times
+            .iter()
+            .map(|total| total.known_last_played as f64 / total.track_count.max(1) as f64)
+            .sum::<f64>()
+            / totals.len() as f64;
+        result.push(render(
+            format!("{kind}_last_played"),
+            score,
+            coverage,
+            &known_times,
+        ));
+    }
+    result
+}
+
+fn read_only_sqlite_uri(path: &str) -> Result<String, String> {
+    let absolute = fs::canonicalize(path)
+        .map_err(|error| format!("cannot resolve listening history: {error}"))?;
+    let normalized = absolute
+        .to_str()
+        .ok_or("listening-history path is not valid Unicode")?
+        .replace('\\', "/");
+    let normalized = normalized.strip_prefix("//?/").unwrap_or(&normalized);
+    let mut uri = String::from("file:");
+    for byte in normalized.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'/' | b':' | b'-' | b'_' | b'.' | b'~') {
+            uri.push(byte as char);
+        } else {
+            use std::fmt::Write as _;
+            write!(&mut uri, "%{byte:02X}").unwrap();
+        }
+    }
+    uri.push_str("?mode=ro");
+    Ok(uri)
 }
 
 fn required_artifact<'a>(
@@ -746,6 +1056,26 @@ fn verified_artifact_bytes(artifact: &ArtifactDescriptor) -> Result<Vec<u8>, Str
         return Err(format!("{} artifact SHA-256 mismatch", artifact.kind));
     }
     Ok(bytes)
+}
+
+fn verify_artifact_file(artifact: &ArtifactDescriptor) -> Result<(), String> {
+    let mut file = fs::File::open(&artifact.path)
+        .map_err(|error| format!("cannot read {} artifact: {error}", artifact.kind))?;
+    let mut digest = Sha256::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let size = file
+            .read(&mut buffer)
+            .map_err(|error| format!("cannot read {} artifact: {error}", artifact.kind))?;
+        if size == 0 {
+            break;
+        }
+        digest.update(&buffer[..size]);
+    }
+    if format!("{:x}", digest.finalize()) != artifact.sha256 {
+        return Err(format!("{} artifact SHA-256 mismatch", artifact.kind));
+    }
+    Ok(())
 }
 
 fn validate_tracks_persistent(connection: &Connection) -> Result<(), String> {
@@ -855,13 +1185,16 @@ fn query_local_signals(
                 "SELECT urlmd5, COALESCE(playCount, 0), COALESCE(lastPlayed, 0), added FROM tracks_persistent WHERE urlmd5 IN ({placeholders})"
             ),
             ListeningHistorySource::AlternativePlayCount => format!(
-                "SELECT tp.urlmd5,
+                "WITH wanted(urlmd5) AS (VALUES {})
+                 SELECT wanted.urlmd5,
                         CASE WHEN apc.urlmd5 IS NULL THEN NULL ELSE COALESCE(apc.playCount, 0) END,
                         CASE WHEN apc.urlmd5 IS NULL THEN NULL ELSE COALESCE(apc.lastPlayed, 0) END,
                         tp.added
-                   FROM tracks_persistent tp
-                   LEFT JOIN alternativeplaycount apc ON apc.urlmd5 = tp.urlmd5
-                  WHERE tp.urlmd5 IN ({placeholders})"
+                   FROM wanted
+                   LEFT JOIN tracks_persistent tp ON tp.urlmd5 = wanted.urlmd5
+                   LEFT JOIN alternativeplaycount apc ON apc.urlmd5 = wanted.urlmd5
+                  WHERE tp.urlmd5 IS NOT NULL OR apc.urlmd5 IS NOT NULL",
+                std::iter::repeat_n("(?)", batch.len()).collect::<Vec<_>>().join(",")
             ),
         };
         let mut statement = connection
@@ -1025,6 +1358,142 @@ mod tests {
     static FIXTURE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
     #[test]
+    fn aggregate_prepare_requires_a_trusted_catalogue_and_retains_snapshot_totals() {
+        let persist = library_signal_fixture_database(&[
+            ("one", 3, Some(0), None),
+            ("two", 4, Some(0), None),
+        ]);
+        let catalogue = fixture_path("sqlite");
+        let db = Connection::open(&catalogue).unwrap();
+        db.execute_batch("CREATE TABLE tracks(id INTEGER PRIMARY KEY, urlmd5 TEXT, album INTEGER, primary_artist INTEGER); CREATE TABLE contributors(id INTEGER PRIMARY KEY, musicbrainz_id TEXT); CREATE TABLE contributor_track(track INTEGER, contributor INTEGER, role INTEGER); INSERT INTO tracks VALUES (1,'one',10,1),(2,'two',10,2); INSERT INTO contributor_track VALUES (1,2,6);").unwrap();
+        drop(db);
+        let (_path, artifact) = identity_artifact(&[("1", "one")]);
+        let options = serde_json::json!({"aggregate_identity_mode":"shared_artist"});
+        let mut provider = LibrarySignalsState::default();
+        let error = provider
+            .prepare_with_options(
+                &options,
+                std::slice::from_ref(&artifact),
+                &[persist_resource(&persist)],
+            )
+            .unwrap_err();
+        assert!(error.contains("lms-catalogue-sqlite-v1"));
+        let catalogue_resource = ResourceDescriptor {
+            kind: "lms-catalogue-sqlite-v1".to_owned(),
+            path: catalogue.display().to_string(),
+            access: ResourceAccess::ReadOnly,
+        };
+        provider
+            .prepare_with_options(
+                &options,
+                std::slice::from_ref(&artifact),
+                &[persist_resource(&persist), catalogue_resource.clone()],
+            )
+            .unwrap();
+        let totals = provider.aggregate_totals.as_ref().unwrap();
+        assert_eq!(provider.aggregate_scope, Some("candidate_groups"));
+        assert_eq!(totals.album(10).unwrap().playcount_sum, 7);
+        assert_eq!(totals.artist(2).unwrap().playcount_sum, 7);
+        let response = provider.score("aggregate-test", &[candidate("candidate-one", "one")]);
+        let GuidanceResponse::Scores { signals, .. } = response else {
+            panic!("expected aggregate signals");
+        };
+        let album = signals
+            .iter()
+            .find(|signal| signal.channel == "album_playcount")
+            .expect("album play-count observation");
+        assert_eq!(album.observation.as_ref().unwrap()["playcount_sum"], 7);
+        assert_eq!(album.observation.as_ref().unwrap()["track_count"], 2);
+        assert!(signals
+            .iter()
+            .any(|signal| signal.channel == "artist_playcount"));
+        assert!(signals
+            .iter()
+            .any(|signal| signal.channel == "album_last_played"));
+        assert!(signals
+            .iter()
+            .any(|signal| signal.channel == "artist_last_played"));
+        for channel in ["playcount", "album_playcount", "artist_playcount"] {
+            let signal = signals
+                .iter()
+                .find(|signal| signal.channel == channel)
+                .unwrap();
+            assert_eq!(
+                signal.observation.as_ref().unwrap()["guidance_family_v1"],
+                "listening_playcount"
+            );
+        }
+        for channel in ["last_played", "album_last_played", "artist_last_played"] {
+            let signal = signals
+                .iter()
+                .find(|signal| signal.channel == channel)
+                .unwrap();
+            assert_eq!(
+                signal.observation.as_ref().unwrap()["guidance_family_v1"],
+                "listening_last_played"
+            );
+        }
+        let sqlite = provider.connection.as_ref().unwrap();
+        assert!(sqlite
+            .execute("UPDATE catalogue.tracks SET album=99", [])
+            .is_err());
+        assert!(sqlite
+            .execute("UPDATE tracks_persistent SET playCount=99", [])
+            .is_err());
+        assert_eq!(
+            sqlite
+                .query_row("SELECT count(*) FROM catalogue.tracks", [], |row| row
+                    .get::<_, i64>(0))
+                .unwrap(),
+            2
+        );
+        let writer = Connection::open(&persist).unwrap();
+        writer
+            .execute(
+                "UPDATE tracks_persistent SET playCount=99 WHERE urlmd5='one'",
+                [],
+            )
+            .unwrap();
+        assert_eq!(
+            provider
+                .aggregate_totals
+                .as_ref()
+                .unwrap()
+                .album(10)
+                .unwrap()
+                .playcount_sum,
+            7
+        );
+        assert_eq!(
+            provider
+                .connection
+                .as_ref()
+                .unwrap()
+                .query_row(
+                    "SELECT playCount FROM tracks_persistent WHERE urlmd5='one'",
+                    [],
+                    |row| row.get::<_, i64>(0)
+                )
+                .unwrap(),
+            3
+        );
+        provider.reset();
+        assert!(provider.aggregate_totals.is_none());
+        provider.prepare_with_options(&serde_json::json!({"aggregate_identity_mode":"shared_artist", "omit_artist_aggregates":1}), &[artifact], &[persist_resource(&persist), catalogue_resource]).unwrap();
+        let GuidanceResponse::Scores { signals, .. } =
+            provider.score("album-only", &[candidate("candidate-one", "one")])
+        else {
+            panic!("expected scores");
+        };
+        assert!(signals
+            .iter()
+            .any(|signal| signal.channel == "album_playcount"));
+        assert!(!signals
+            .iter()
+            .any(|signal| signal.channel.starts_with("artist_")));
+    }
+
+    #[test]
     fn version_metadata_identifies_library_signals_provider_and_spi() {
         let metadata = version_metadata_json();
         assert!(metadata.contains("\"program\":\"bliss-guidance-library-signals\""));
@@ -1164,13 +1633,36 @@ mod tests {
                 .iter()
                 .map(|channel| channel.channel.as_str())
                 .collect::<Vec<_>>(),
-            vec!["playcount", "last_played", "library_age"],
+            vec![
+                "playcount",
+                "last_played",
+                "library_age",
+                "album_playcount",
+                "artist_playcount",
+                "album_last_played",
+                "artist_last_played"
+            ],
         );
         assert_eq!(
             manifest.configuration_schema.as_ref().unwrap()["properties"]
                 ["listening_history_source"]["enum"],
             serde_json::json!(["lyrion", "alternative_play_count"]),
         );
+    }
+
+    #[test]
+    fn apc_track_history_does_not_require_a_lyrion_persistent_row() {
+        let db = Connection::open_in_memory().unwrap();
+        db.execute_batch("CREATE TABLE tracks_persistent (urlmd5 TEXT PRIMARY KEY, playCount INTEGER, lastPlayed INTEGER, added INTEGER); CREATE TABLE alternativeplaycount (urlmd5 TEXT PRIMARY KEY, playCount INTEGER, lastPlayed INTEGER); INSERT INTO alternativeplaycount VALUES ('apc-only', 4, 123);").unwrap();
+        let values = query_local_signals(
+            &db,
+            &["apc-only".into()],
+            ListeningHistorySource::AlternativePlayCount,
+        )
+        .unwrap();
+        assert_eq!(values["apc-only"].playcount, Some(4));
+        assert_eq!(values["apc-only"].last_played, Some(123));
+        assert_eq!(values["apc-only"].library_age, None);
     }
 
     #[test]
